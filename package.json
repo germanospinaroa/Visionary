@@ -1,0 +1,35 @@
+{
+  "name": "visual-validator-mvp",
+  "version": "0.1.0",
+  "private": true,
+  "scripts": {
+    "dev": "next dev",
+    "build": "next build",
+    "start": "next start",
+    "lint": "next lint",
+    "supabase:provision-storage": "node scripts/provision-supabase-storage.mjs",
+    "supabase:validate": "node scripts/validate-supabase.mjs",
+    "pilot:worker": "tsx scripts/run-pilot-worker.ts",
+    "pilot:service": "tsx worker-service/server.ts",
+    "pilot:service:health": "node scripts/check-worker-health.mjs"
+  },
+  "dependencies": {
+    "@supabase/ssr": "^0.10.3",
+    "@supabase/supabase-js": "^2.106.2",
+    "next": "^15.3.1",
+    "openai": "^4.104.0",
+    "playwright": "^1.60.0",
+    "postcss": "^8.5.15",
+    "react": "^19.2.0",
+    "react-dom": "^19.2.0",
+    "sharp": "^0.34.5",
+    "source-map-js": "^1.2.1"
+  },
+  "devDependencies": {
+    "@types/node": "^22.15.17",
+    "@types/react": "^19.1.2",
+    "@types/react-dom": "^19.1.2",
+    "tsx": "^4.22.3",
+    "typescript": "^5.8.3"
+  }
+}

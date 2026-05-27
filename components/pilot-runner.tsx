@@ -1,0 +1,488 @@
+"use client";
+
+import { useEffect, useMemo, useState } from "react";
+
+type EventDetails = {
+  step?: string;
+  timestamp?: string;
+  action?: string;
+  evidenceImageId?: string;
+  [key: string]: unknown;
+};
+
+type RunSummary = {
+  id: string;
+  status: string;
+  survey_url: string | null;
+  current_step: string | null;
+  current_question_index: number | null;
+  final_code: string | null;
+  created_at: string;
+  completed_at: string | null;
+};
+
+type RunDetails = {
+  run: RunSummary & {
+    browser_session_id?: string | null;
+    last_error?: string | null;
+    last_heartbeat_at?: string | null;
+    current_screenshot_updated_at?: string | null;
+    current_question_text?: string | null;
+    last_reasoning_summary?: string | null;
+    last_selected_option_text?: string | null;
+    last_supervisor_decision?: string | null;
+  };
+  questions: Array<{
+    id: string;
+    question_index: number;
+    detected_question: string | null;
+    answers: Array<{
+      id: string;
+      selected_option_text: string | null;
+      confidence: string | null;
+      explanation: string | null;
+      supervisor_status: string | null;
+      evidence_image_id?: string | null;
+    }>;
+  }>;
+  events: Array<{
+    id: string;
+    level: string;
+    event_type: string;
+    message: string;
+    created_at: string;
+    details?: EventDetails;
+  }>;
+  currentScreenshotUrl: string | null;
+  errorScreenshotUrl: string | null;
+};
+
+type StartRunResponse = {
+  runId: string;
+  launchAccepted: boolean;
+  message: string;
+};
+
+function formatTimestamp(value: string | null | undefined) {
+  if (!value) {
+    return "n/a";
+  }
+
+  return new Intl.DateTimeFormat("es-MX", {
+    dateStyle: "short",
+    timeStyle: "medium"
+  }).format(new Date(value));
+}
+
+function getStatusTone(status: string) {
+  if (status === "completed") {
+    return "neutral";
+  }
+
+  if (status === "failed") {
+    return "danger";
+  }
+
+  if (status === "paused") {
+    return "warn";
+  }
+
+  return "ok";
+}
+
+function getCurrentAction(event: RunDetails["events"][number] | null) {
+  if (!event) {
+    return "Iniciando navegador del agente…";
+  }
+
+  return event.message;
+}
+
+function getOperationalStep(step: string | null, questionIndex: number | null) {
+  if (!step) {
+    return "Preparando ejecución";
+  }
+
+  if (step === "created") {
+    return "Preparando ejecución";
+  }
+
+  if (step === "opening_survey") {
+    return "Abriendo encuesta";
+  }
+
+  if (step === "extracting_images") {
+    return "Descargando imágenes";
+  }
+
+  if (step === "selecting_used_images") {
+    return "Seleccionando imágenes usadas";
+  }
+
+  if (step === "completed") {
+    return "Encuesta finalizada";
+  }
+
+  if (step === "failed") {
+    return "Ejecución fallida";
+  }
+
+  if (step.startsWith("question_") || step.startsWith("answering_question_")) {
+    return `Analizando pregunta ${(questionIndex ?? 0) + 1}`;
+  }
+
+  return step.replace(/_/g, " ");
+}
+
+function getTimelineEvents(events: RunDetails["events"]) {
+  return events
+    .filter((event) => event.event_type !== "live_browser_captured")
+    .slice(0, 10);
+}
+
+export function PilotRunner() {
+  const [surveyUrl, setSurveyUrl] = useState(process.env.NEXT_PUBLIC_SURVEY_URL ?? "");
+  const [storeCode, setStoreCode] = useState("");
+  const [validatorCode, setValidatorCode] = useState(process.env.NEXT_PUBLIC_VALIDATOR_CODE ?? "");
+  const [activeRunId, setActiveRunId] = useState<string | null>(null);
+  const [activeRun, setActiveRun] = useState<RunDetails | null>(null);
+  const [isSubmitting, setIsSubmitting] = useState(false);
+  const [isPausing, setIsPausing] = useState(false);
+  const [isStopping, setIsStopping] = useState(false);
+  const [statusNotice, setStatusNotice] = useState<string | null>(null);
+  const [errorNotice, setErrorNotice] = useState<string | null>(null);
+
+  useEffect(() => {
+    let cancelled = false;
+
+    async function loadRuns() {
+      const response = await fetch("/api/pilot-runs");
+      const payload = (await response.json()) as { runs: RunSummary[] };
+
+      if (cancelled) {
+        return;
+      }
+
+      if (!activeRunId && payload.runs[0]?.id) {
+        setActiveRunId(payload.runs[0].id);
+      }
+    }
+
+    void loadRuns();
+    const interval = setInterval(() => void loadRuns(), 4000);
+
+    return () => {
+      cancelled = true;
+      clearInterval(interval);
+    };
+  }, [activeRunId]);
+
+  useEffect(() => {
+    if (!activeRunId) {
+      return;
+    }
+
+    let cancelled = false;
+
+    async function loadRun() {
+      const response = await fetch(`/api/pilot-runs/${activeRunId}`);
+      const payload = (await response.json()) as RunDetails;
+
+      if (!cancelled) {
+        setActiveRun(payload);
+      }
+    }
+
+    void loadRun();
+    const interval = setInterval(() => void loadRun(), 2000);
+
+    return () => {
+      cancelled = true;
+      clearInterval(interval);
+    };
+  }, [activeRunId]);
+
+  const latestEvent = activeRun?.events[0] ?? null;
+  const latestAnswer = useMemo(() => {
+    if (!activeRun) {
+      return null;
+    }
+
+    return [...activeRun.questions]
+      .reverse()
+      .map((question) => question.answers[0] ?? null)
+      .find(Boolean);
+  }, [activeRun]);
+  const timelineEvents = activeRun ? getTimelineEvents(activeRun.events) : [];
+  const currentAction = getCurrentAction(latestEvent);
+  const currentStep = activeRun
+    ? getOperationalStep(activeRun.run.current_step, activeRun.run.current_question_index)
+    : "Preparando ejecución";
+
+  async function onExecute() {
+    setIsSubmitting(true);
+    setErrorNotice(null);
+    setStatusNotice("Iniciando navegador del agente…");
+
+    try {
+      const response = await fetch("/api/pilot-runs", {
+        method: "POST",
+        headers: {
+          "content-type": "application/json"
+        },
+        body: JSON.stringify({
+          surveyUrl,
+          storeCode,
+          validatorCode
+        })
+      });
+
+      const payload = (await response.json()) as StartRunResponse & { error?: string };
+
+      if (!response.ok) {
+        throw new Error(payload.error ?? payload.message ?? "No se pudo ejecutar el piloto.");
+      }
+
+      setActiveRunId(payload.runId);
+      setStatusNotice(payload.message);
+    } catch (error) {
+      setStatusNotice(null);
+      setErrorNotice(error instanceof Error ? error.message : "No se pudo ejecutar el piloto.");
+    } finally {
+      setIsSubmitting(false);
+    }
+  }
+
+  async function onPause() {
+    if (!activeRunId) {
+      return;
+    }
+
+    setIsPausing(true);
+    setErrorNotice(null);
+
+    try {
+      const response = await fetch(`/api/pilot-runs/${activeRunId}/pause`, {
+        method: "POST"
+      });
+      const payload = (await response.json()) as { message?: string; error?: string };
+
+      if (!response.ok) {
+        throw new Error(payload.error ?? payload.message ?? "No se pudo pausar el piloto.");
+      }
+
+      setStatusNotice(payload.message ?? "Piloto pausado.");
+    } catch (error) {
+      setErrorNotice(error instanceof Error ? error.message : "No se pudo pausar el piloto.");
+    } finally {
+      setIsPausing(false);
+    }
+  }
+
+  async function onStop() {
+    if (!activeRunId) {
+      return;
+    }
+
+    setIsStopping(true);
+    setErrorNotice(null);
+
+    try {
+      const response = await fetch(`/api/pilot-runs/${activeRunId}/stop`, {
+        method: "POST"
+      });
+      const payload = (await response.json()) as { message?: string; error?: string };
+
+      if (!response.ok) {
+        throw new Error(payload.error ?? payload.message ?? "No se pudo detener el piloto.");
+      }
+
+      setStatusNotice(payload.message ?? "Piloto detenido.");
+    } catch (error) {
+      setErrorNotice(error instanceof Error ? error.message : "No se pudo detener el piloto.");
+    } finally {
+      setIsStopping(false);
+    }
+  }
+
+  return (
+    <section className="pilot-console">
+      <header className="pilot-hero">
+        <div>
+          <span className="eyebrow">Retail Visual Audit Pilot</span>
+          <h1>Retail Visual Audit Pilot</h1>
+          <p>Operational AI-assisted retail audit workflow.</p>
+        </div>
+        {activeRun ? (
+          <div className="hero-status">
+            <span className={`badge tone-${getStatusTone(activeRun.run.status)}`}>{activeRun.run.status}</span>
+            <span className="hero-runid">Run {activeRun.run.id}</span>
+          </div>
+        ) : null}
+      </header>
+
+      <div className="pilot-three-column">
+        <section className="card control-panel">
+          <div className="panel-header">
+            <span className="eyebrow">Configuración</span>
+            <h2>Ejecutar piloto</h2>
+          </div>
+
+          {statusNotice ? <div className="banner-info">{statusNotice}</div> : null}
+          {errorNotice ? <div className="banner-error">{errorNotice}</div> : null}
+
+          <div className="field">
+            <label htmlFor="surveyUrl">Survey URL</label>
+            <input id="surveyUrl" value={surveyUrl} onChange={(event) => setSurveyUrl(event.target.value)} />
+          </div>
+
+          <div className="field">
+            <label htmlFor="storeCode">Store Code</label>
+            <input id="storeCode" value={storeCode} onChange={(event) => setStoreCode(event.target.value)} />
+          </div>
+
+          <div className="field">
+            <label htmlFor="validatorCode">Validator Code</label>
+            <input
+              id="validatorCode"
+              value={validatorCode}
+              onChange={(event) => setValidatorCode(event.target.value)}
+            />
+          </div>
+
+          <div className="control-actions">
+            <button className="button" type="button" onClick={onExecute} disabled={isSubmitting}>
+              {isSubmitting ? "Ejecutando…" : "Ejecutar piloto"}
+            </button>
+            <button className="button secondary" type="button" onClick={onPause} disabled={!activeRunId || isPausing}>
+              {isPausing ? "Pausando…" : "Pausar"}
+            </button>
+            <button className="button secondary danger" type="button" onClick={onStop} disabled={!activeRunId || isStopping}>
+              {isStopping ? "Deteniendo…" : "Detener"}
+            </button>
+          </div>
+
+          <div className="status-card">
+            <span className="status-label">Estado</span>
+            <strong>{activeRun?.run.status ?? "Idle"}</strong>
+            <span>{currentStep}</span>
+          </div>
+        </section>
+
+        <section className="card live-browser-panel">
+          <div className="live-browser-header">
+            <div>
+              <span className="eyebrow">Live Browser</span>
+              <h2>Live Browser</h2>
+            </div>
+            {activeRun ? (
+              <div className="live-browser-tags">
+                <span>Run ID: {activeRun.run.id}</span>
+                <span>Heartbeat: {formatTimestamp(activeRun.run.last_heartbeat_at)}</span>
+              </div>
+            ) : null}
+          </div>
+
+          <div className="live-browser-statusbar">
+            <span>Estado actual: {activeRun?.run.status ?? "preparando"}</span>
+            <span>Paso actual: {currentStep}</span>
+            <span>Última acción: {latestEvent?.message ?? "Iniciando navegador del agente…"}</span>
+          </div>
+
+          <div className="browser-shell">
+            <div className="browser-chrome">
+              <span className="browser-dot red" />
+              <span className="browser-dot amber" />
+              <span className="browser-dot green" />
+              <div className="browser-address">{activeRun?.run.survey_url ?? surveyUrl ?? "Cargando destino"}</div>
+            </div>
+            <div className="browser-stage">
+              {activeRun?.currentScreenshotUrl ? (
+                <img
+                  className="live-browser-image"
+                  src={`${activeRun.currentScreenshotUrl}&t=${Date.now()}`}
+                  alt="Live browser"
+                />
+              ) : (
+                <div className="browser-empty">
+                  Aún no hay vista del navegador. El agente está iniciando o preparando la navegación.
+                </div>
+              )}
+            </div>
+          </div>
+
+          <div className="live-browser-footer">
+            <span>Última captura: {formatTimestamp(activeRun?.run.current_screenshot_updated_at)}</span>
+            <span>Página visible: {activeRun?.run.current_question_text ?? "Cargando contexto de encuesta"}</span>
+          </div>
+
+          <p className="live-browser-action">Acción actual: {currentAction}</p>
+        </section>
+
+        <section className="card agent-status-panel">
+          <div className="panel-header">
+            <span className="eyebrow">Agent Status</span>
+            <h2>Estado del agente</h2>
+          </div>
+
+          <div className="status-detail-list">
+            <article className="status-detail">
+              <span>Current Step</span>
+              <strong>{currentStep}</strong>
+            </article>
+            <article className="status-detail">
+              <span>Current Question</span>
+              <strong>{activeRun?.run.current_question_text ?? "Aún sin pregunta detectada"}</strong>
+            </article>
+            <article className="status-detail">
+              <span>Selected Answer</span>
+              <strong>{activeRun?.run.last_selected_option_text ?? "Pendiente"}</strong>
+            </article>
+            <article className="status-detail">
+              <span>Confidence</span>
+              <strong>{latestAnswer?.confidence ?? "Pendiente"}</strong>
+            </article>
+            <article className="status-detail">
+              <span>Supervisor Decision</span>
+              <strong>{activeRun?.run.last_supervisor_decision ?? "Pendiente"}</strong>
+            </article>
+            <article className="status-detail">
+              <span>Image Used</span>
+              <strong>{latestAnswer?.evidence_image_id ?? "Pendiente"}</strong>
+            </article>
+            <article className="status-detail full">
+              <span>Reasoning Summary</span>
+              <strong>{activeRun?.run.last_reasoning_summary ?? "Aún no hay explicación operacional disponible."}</strong>
+            </article>
+            {activeRun?.run.last_error ? (
+              <article className="status-detail full danger">
+                <span>Error</span>
+                <strong>{activeRun.run.last_error}</strong>
+              </article>
+            ) : null}
+          </div>
+        </section>
+      </div>
+
+      <section className="card timeline-panel">
+        <div className="panel-header">
+          <span className="eyebrow">Timeline</span>
+          <h2>Secuencia operativa</h2>
+        </div>
+        <div className="timeline-list">
+          {timelineEvents.length > 0 ? (
+            timelineEvents.map((event) => (
+              <article key={event.id} className={`timeline-item level-${event.level}`}>
+                <span className="timeline-time">{formatTimestamp(event.created_at)}</span>
+                <strong>{event.message}</strong>
+                <span className="timeline-step">{event.details?.step?.replace(/_/g, " ") ?? "proceso"}</span>
+              </article>
+            ))
+          ) : (
+            <div className="timeline-empty">La línea de tiempo aparecerá cuando el agente comience a interactuar con la encuesta.</div>
+          )}
+        </div>
+      </section>
+    </section>
+  );
+}
