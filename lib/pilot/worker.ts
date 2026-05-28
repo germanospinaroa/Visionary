@@ -33,6 +33,42 @@ type VisibleMatch = {
   selector: string;
 };
 
+type SelectorResolution = VisibleMatch & {
+  strategy: "configured" | "fallback";
+  fallbackLabel?: string;
+  attemptedSelectors: string[];
+  failedSelectors: string[];
+};
+
+type ScreenInputDiagnostic = {
+  tag: string;
+  type: string;
+  name: string;
+  id: string;
+  placeholder: string;
+  visible: boolean;
+  disabled: boolean;
+};
+
+type ScreenButtonDiagnostic = {
+  tag: string;
+  text: string;
+  type: string;
+  name: string;
+  id: string;
+  value: string;
+  visible: boolean;
+  disabled: boolean;
+};
+
+type ScreenDiagnostics = {
+  url: string;
+  title: string;
+  htmlPartial: string;
+  inputs: ScreenInputDiagnostic[];
+  buttons: ScreenButtonDiagnostic[];
+};
+
 type ExtractedOption = {
   text: string;
   locator: Locator;
@@ -85,6 +121,10 @@ function normalizeText(value: string) {
     .toLowerCase();
 }
 
+function buildHtmlArtifactPath(runId: string, name: string) {
+  return path.posix.join("runs", runId, "artifacts", `${name}.html`);
+}
+
 async function firstVisible(page: Page, selectors: string[]): Promise<VisibleMatch | null> {
   for (const selector of selectors) {
     const locator = page.locator(selector).first();
@@ -100,6 +140,64 @@ async function firstVisible(page: Page, selectors: string[]): Promise<VisibleMat
         continue;
       }
     }
+  }
+
+  return null;
+}
+
+async function resolveTarget(
+  page: Page,
+  configuredSelectors: string[],
+  fallbackCandidates: Array<{ selector: string; label: string }>
+): Promise<SelectorResolution | null> {
+  const attemptedSelectors: string[] = [];
+  const failedSelectors: string[] = [];
+
+  for (const selector of configuredSelectors) {
+    attemptedSelectors.push(selector);
+    const locator = page.locator(selector).first();
+
+    try {
+      if (await locator.count()) {
+        if (await locator.isVisible()) {
+          return {
+            locator,
+            selector,
+            strategy: "configured",
+            attemptedSelectors,
+            failedSelectors
+          };
+        }
+      }
+    } catch {
+      // Continue to next selector.
+    }
+
+    failedSelectors.push(selector);
+  }
+
+  for (const candidate of fallbackCandidates) {
+    attemptedSelectors.push(candidate.selector);
+    const locator = page.locator(candidate.selector).first();
+
+    try {
+      if (await locator.count()) {
+        if (await locator.isVisible()) {
+          return {
+            locator,
+            selector: candidate.selector,
+            strategy: "fallback",
+            fallbackLabel: candidate.label,
+            attemptedSelectors,
+            failedSelectors
+          };
+        }
+      }
+    } catch {
+      // Continue to next selector.
+    }
+
+    failedSelectors.push(candidate.selector);
   }
 
   return null;
@@ -125,6 +223,187 @@ async function clickNext(page: Page, selectors: string[]) {
 
   await match.locator.click();
   return match;
+}
+
+async function collectScreenDiagnostics(page: Page): Promise<ScreenDiagnostics> {
+  const url = page.url();
+  const title = await page.title().catch(() => "");
+  const htmlPartial = await page
+    .locator("body")
+    .evaluate((element) => (element instanceof HTMLElement ? element.outerHTML.slice(0, 50_000) : ""))
+    .catch(() => "");
+
+  const inputs = await page.locator("input, textarea, select").evaluateAll((elements) => {
+    const isVisible = (element: Element) => {
+      const rect = element.getBoundingClientRect();
+      const style = window.getComputedStyle(element);
+      return rect.width > 0 && rect.height > 0 && style.visibility !== "hidden" && style.display !== "none";
+    };
+
+    return elements.map((element) => {
+      const input = element as HTMLInputElement | HTMLTextAreaElement | HTMLSelectElement;
+      return {
+        tag: element.tagName.toLowerCase(),
+        type: "type" in input ? input.type ?? "" : "",
+        name: input.getAttribute("name") ?? "",
+        id: input.id ?? "",
+        placeholder: input.getAttribute("placeholder") ?? "",
+        visible: isVisible(element),
+        disabled: "disabled" in input ? Boolean(input.disabled) : false
+      };
+    });
+  });
+
+  const buttons = await page
+    .locator('button, input[type="submit"], input[type="button"]')
+    .evaluateAll((elements) => {
+      const isVisible = (element: Element) => {
+        const rect = element.getBoundingClientRect();
+        const style = window.getComputedStyle(element);
+        return rect.width > 0 && rect.height > 0 && style.visibility !== "hidden" && style.display !== "none";
+      };
+
+      return elements.map((element) => {
+        const control = element as HTMLButtonElement | HTMLInputElement;
+        const text = element instanceof HTMLButtonElement ? element.innerText.trim() : "";
+        return {
+          tag: element.tagName.toLowerCase(),
+          text,
+          type: "type" in control ? control.type ?? "" : "",
+          name: control.getAttribute("name") ?? "",
+          id: control.id ?? "",
+          value: "value" in control ? control.value ?? "" : "",
+          visible: isVisible(element),
+          disabled: "disabled" in control ? Boolean(control.disabled) : false
+        };
+      });
+    });
+
+  return {
+    url,
+    title,
+    htmlPartial,
+    inputs,
+    buttons
+  };
+}
+
+async function uploadHtmlArtifact({
+  runId,
+  name,
+  html
+}: {
+  runId: string;
+  name: string;
+  html: string;
+}) {
+  const filePath = buildHtmlArtifactPath(runId, name);
+
+  await uploadBufferToStorage({
+    bucket: STORAGE_BUCKETS.analysisArtifacts,
+    filePath,
+    buffer: Buffer.from(html, "utf8"),
+    contentType: "text/html; charset=utf-8"
+  });
+
+  return {
+    bucket: STORAGE_BUCKETS.analysisArtifacts,
+    path: filePath
+  };
+}
+
+async function recordScreenDiagnostics({
+  page,
+  runId,
+  step,
+  name,
+  message,
+  metadata = {}
+}: {
+  page: Page;
+  runId: string;
+  step: string;
+  name: string;
+  message: string;
+  metadata?: Record<string, unknown>;
+}) {
+  const screenshot = await captureActionScreenshot({
+    page,
+    runId,
+    step,
+    action: name,
+    message
+  });
+  const diagnostics = await collectScreenDiagnostics(page);
+  const htmlArtifact = await uploadHtmlArtifact({
+    runId,
+    name,
+    html: diagnostics.htmlPartial
+  });
+  const jsonArtifact = await uploadJsonArtifact({
+    runId,
+    name,
+    payload: diagnostics
+  });
+
+  await emitWorkerEvent({
+    runId,
+    level: "warn",
+    eventType: "screen_diagnostic_saved",
+    step,
+    message,
+    metadata: {
+      ...metadata,
+      diagnosticsArtifactPath: jsonArtifact.path,
+      htmlArtifactPath: htmlArtifact.path,
+      detectedInputCount: diagnostics.inputs.length,
+      detectedButtonCount: diagnostics.buttons.length
+    },
+    screenshotBucket: STORAGE_BUCKETS.analysisArtifacts,
+    screenshotPath: screenshot.storagePath
+  });
+
+  return {
+    screenshot,
+    diagnostics,
+    htmlArtifact,
+    jsonArtifact
+  };
+}
+
+function getStoreInputFallbacks() {
+  return [
+    { selector: "input:visible", label: "visible_input" },
+    { selector: 'input[type="text"]:visible', label: "text_input" },
+    { selector: 'input:not([disabled]):visible', label: "first_enabled_input" },
+    { selector: 'label:has-text("Código") input', label: "input_near_codigo_label" },
+    { selector: 'label:has-text("Codigo") input', label: "input_near_codigo_label_ascii" },
+    {
+      selector:
+        'xpath=(//*[contains(translate(normalize-space(.), "ÁÉÍÓÚABCDEFGHIJKLMNOPQRSTUVWXYZ", "aeiouabcdefghijklmnopqrstuvwxyz"), "codigo")])[1]/following::input[not(@disabled)][1]',
+      label: "input_near_codigo_text"
+    },
+    { selector: 'input[placeholder*="código" i]:visible', label: "codigo_placeholder" },
+    { selector: 'input[placeholder*="codigo" i]:visible', label: "codigo_placeholder_ascii" }
+  ];
+}
+
+function getEntryButtonFallbacks() {
+  return [
+    { selector: 'button:has-text("Entrar")', label: "entrar_text_button" },
+    { selector: 'button:has-text("Ingresar")', label: "ingresar_text_button" },
+    { selector: 'button:visible', label: "first_visible_button" },
+    { selector: 'input[type="button"]:visible', label: "button_input" },
+    { selector: 'input[type="submit"]:visible', label: "submit_input" }
+  ];
+}
+
+async function resolveStoreCodeInput(page: Page, selectors: SurveySelectorConfig) {
+  return resolveTarget(page, selectors.storeCodeInputSelectors, getStoreInputFallbacks());
+}
+
+async function resolveEntryButton(page: Page, selectors: SurveySelectorConfig) {
+  return resolveTarget(page, selectors.entryButtonSelectors, getEntryButtonFallbacks());
 }
 
 async function pageLooksLikeUsedImages(page: Page) {
@@ -839,13 +1118,90 @@ export async function runPilotSurvey(runId: string) {
         storeCode
       }
     });
-    const storeCodeMatch = await fillFirstAvailable(page, browserConfig.selectors.storeCodeInputSelectors, storeCode);
-    await assertFieldValue({
-      locator: storeCodeMatch.locator,
-      expectedValue: storeCode,
-      fieldName: "store code",
-      step: "initial_screen"
+
+    const storeCodeMatch = await resolveStoreCodeInput(page, browserConfig.selectors);
+
+    if (!storeCodeMatch) {
+      await recordScreenDiagnostics({
+        page,
+        runId,
+        step: "initial_screen",
+        name: "initial-screen-store-input-missing",
+        message: "No se encontró un campo válido para store code.",
+        metadata: {
+          attemptedSelectors: [
+            ...browserConfig.selectors.storeCodeInputSelectors,
+            ...getStoreInputFallbacks().map((fallback) => fallback.selector)
+          ]
+        }
+      });
+      throw new PilotFlowError(
+        "No se encontró un campo válido para store code en la pantalla inicial.",
+        "needs_selector_calibration",
+        "initial_screen"
+      );
+    }
+
+    if (storeCodeMatch.strategy === "fallback") {
+      await emitWorkerEvent({
+        runId,
+        level: "warn",
+        eventType: "selector_fallback_used",
+        step: "initial_screen",
+        message: "Selector configurado para campo tienda no respondió; se aplicó fallback.",
+        metadata: {
+          attemptedSelectors: storeCodeMatch.attemptedSelectors,
+          failedSelectors: storeCodeMatch.failedSelectors,
+          selectorUsed: storeCodeMatch.selector,
+          fallbackUsed: storeCodeMatch.fallbackLabel
+        }
+      });
+    }
+
+    await emitWorkerEvent({
+      runId,
+      eventType: "selector_resolved",
+      step: "initial_screen",
+      message: "Campo tienda seleccionado para escritura.",
+      metadata: {
+        selectorUsed: storeCodeMatch.selector,
+        resolutionStrategy: storeCodeMatch.strategy,
+        fallbackUsed: storeCodeMatch.fallbackLabel ?? null,
+        attemptedSelectors: storeCodeMatch.attemptedSelectors,
+        failedSelectors: storeCodeMatch.failedSelectors
+      }
     });
+
+    try {
+      await storeCodeMatch.locator.fill(storeCode);
+      await assertFieldValue({
+        locator: storeCodeMatch.locator,
+        expectedValue: storeCode,
+        fieldName: "store code",
+        step: "initial_screen"
+      });
+    } catch {
+      await recordScreenDiagnostics({
+        page,
+        runId,
+        step: "initial_screen",
+        name: "initial-screen-store-fill-failed",
+        message: "Fallo al escribir o confirmar store code.",
+        metadata: {
+          selectorUsed: storeCodeMatch.selector,
+          resolutionStrategy: storeCodeMatch.strategy,
+          fallbackUsed: storeCodeMatch.fallbackLabel ?? null,
+          attemptedSelectors: storeCodeMatch.attemptedSelectors,
+          failedSelectors: storeCodeMatch.failedSelectors
+        }
+      });
+      throw new PilotFlowError(
+        "No se pudo escribir y confirmar el store code en la pantalla inicial.",
+        "needs_selector_calibration",
+        "initial_screen"
+      );
+    }
+
     await captureActionScreenshot({
       page,
       runId,
@@ -854,7 +1210,8 @@ export async function runPilotSurvey(runId: string) {
       message: "Store code visible en el formulario.",
       metadata: {
         storeCode,
-        selectorUsed: storeCodeMatch.selector
+        selectorUsed: storeCodeMatch.selector,
+        fallbackUsed: storeCodeMatch.fallbackLabel ?? null
       }
     });
     await emitWorkerEvent({
@@ -864,7 +1221,9 @@ export async function runPilotSurvey(runId: string) {
       message: "Campo store code llenado.",
       metadata: {
         storeCode,
-        selectorUsed: storeCodeMatch.selector
+        selectorUsed: storeCodeMatch.selector,
+        resolutionStrategy: storeCodeMatch.strategy,
+        fallbackUsed: storeCodeMatch.fallbackLabel ?? null
       }
     });
 
@@ -884,16 +1243,116 @@ export async function runPilotSurvey(runId: string) {
       action: "before-click-entry",
       message: "Antes de hacer clic en Entrar."
     });
-    const entryButtonMatch = await clickNext(page, browserConfig.selectors.entryButtonSelectors);
-    const validatorScreen = await waitForExpectedScreen({
-      page,
-      selectors: browserConfig.selectors,
-      expectedKinds: ["validator"],
-      timeoutMs: 12_000,
-      failureStep: "validator_screen",
-      failureMessage:
-        "No se detectó la segunda pantalla después de Entrar. Se requiere calibración."
+
+    const entryButtonMatch = await resolveEntryButton(page, browserConfig.selectors);
+
+    if (!entryButtonMatch) {
+      await recordScreenDiagnostics({
+        page,
+        runId,
+        step: "initial_screen",
+        name: "initial-screen-entry-button-missing",
+        message: "No se encontró el botón Entrar en la pantalla inicial.",
+        metadata: {
+          attemptedSelectors: [
+            ...browserConfig.selectors.entryButtonSelectors,
+            ...getEntryButtonFallbacks().map((fallback) => fallback.selector)
+          ]
+        }
+      });
+      throw new PilotFlowError(
+        "No se encontró el botón Entrar en la pantalla inicial.",
+        "needs_selector_calibration",
+        "initial_screen"
+      );
+    }
+
+    if (entryButtonMatch.strategy === "fallback") {
+      await emitWorkerEvent({
+        runId,
+        level: "warn",
+        eventType: "selector_fallback_used",
+        step: "initial_screen",
+        message: "Selector configurado para botón Entrar no respondió; se aplicó fallback.",
+        metadata: {
+          attemptedSelectors: entryButtonMatch.attemptedSelectors,
+          failedSelectors: entryButtonMatch.failedSelectors,
+          selectorUsed: entryButtonMatch.selector,
+          fallbackUsed: entryButtonMatch.fallbackLabel
+        }
+      });
+    }
+
+    await emitWorkerEvent({
+      runId,
+      eventType: "selector_resolved",
+      step: "initial_screen",
+      message: "Botón Entrar seleccionado.",
+      metadata: {
+        selectorUsed: entryButtonMatch.selector,
+        resolutionStrategy: entryButtonMatch.strategy,
+        fallbackUsed: entryButtonMatch.fallbackLabel ?? null,
+        attemptedSelectors: entryButtonMatch.attemptedSelectors,
+        failedSelectors: entryButtonMatch.failedSelectors
+      }
     });
+
+    try {
+      await entryButtonMatch.locator.click();
+    } catch {
+      await recordScreenDiagnostics({
+        page,
+        runId,
+        step: "initial_screen",
+        name: "initial-screen-entry-click-failed",
+        message: "Fallo al hacer clic en Entrar.",
+        metadata: {
+          selectorUsed: entryButtonMatch.selector,
+          resolutionStrategy: entryButtonMatch.strategy,
+          fallbackUsed: entryButtonMatch.fallbackLabel ?? null,
+          attemptedSelectors: entryButtonMatch.attemptedSelectors,
+          failedSelectors: entryButtonMatch.failedSelectors
+        }
+      });
+      throw new PilotFlowError(
+        "No se pudo hacer clic en Entrar en la pantalla inicial.",
+        "needs_selector_calibration",
+        "initial_screen"
+      );
+    }
+
+    let validatorScreen: ScreenState;
+
+    try {
+      validatorScreen = await waitForExpectedScreen({
+        page,
+        selectors: browserConfig.selectors,
+        expectedKinds: ["validator"],
+        timeoutMs: 12_000,
+        failureStep: "validator_screen",
+        failureMessage:
+          "No se detectó la segunda pantalla después de Entrar. Se requiere calibración."
+      });
+    } catch {
+      await recordScreenDiagnostics({
+        page,
+        runId,
+        step: "validator_screen",
+        name: "validator-screen-not-detected",
+        message: "No se detectó cambio de pantalla después de hacer clic en Entrar.",
+        metadata: {
+          selectorUsed: entryButtonMatch.selector,
+          resolutionStrategy: entryButtonMatch.strategy,
+          fallbackUsed: entryButtonMatch.fallbackLabel ?? null
+        }
+      });
+      throw new PilotFlowError(
+        "No se detectó la segunda pantalla después de Entrar.",
+        "needs_selector_calibration",
+        "validator_screen"
+      );
+    }
+
     await captureActionScreenshot({
       page,
       runId,
@@ -911,7 +1370,9 @@ export async function runPilotSurvey(runId: string) {
       message: "Clic en Entrar.",
       metadata: {
         context: "entry_screen",
-        selectorUsed: entryButtonMatch.selector
+        selectorUsed: entryButtonMatch.selector,
+        resolutionStrategy: entryButtonMatch.strategy,
+        fallbackUsed: entryButtonMatch.fallbackLabel ?? null
       }
     });
     await emitWorkerEvent({
@@ -1708,5 +2169,70 @@ export async function runPilotSurvey(runId: string) {
     stopLiveBrowserView?.();
     await browser.close();
     await getSurveyRunDetails(runId).catch(() => null);
+  }
+}
+
+export async function diagnosePilotRunScreen(runId: string) {
+  const supabase = createSupabaseAdminClient();
+  const { data: run, error } = await supabase
+    .from("survey_runs")
+    .select("*, stores(store_code)")
+    .eq("id", runId)
+    .single();
+
+  if (error) {
+    throw error;
+  }
+
+  const browserConfig = mergePilotBrowserConfig((run.browser_config as Record<string, unknown>) ?? {});
+  const surveyUrl = run.survey_url;
+
+  if (!surveyUrl) {
+    throw new Error("survey_url no configurado en survey_runs.");
+  }
+
+  await emitWorkerEvent({
+    runId,
+    eventType: "screen_diagnosis_started",
+    step: "diagnostics",
+    message: "Diagnóstico de pantalla solicitado.",
+    metadata: {
+      surveyUrl
+    }
+  });
+
+  const browser = await chromium.launch({
+    headless: browserConfig.headless
+  });
+  const context = await browser.newContext();
+  const page = await context.newPage();
+
+  try {
+    await page.goto(surveyUrl, {
+      waitUntil: "networkidle"
+    });
+    const screen = await classifyScreen(page, browserConfig.selectors);
+    await recordScreenDiagnostics({
+      page,
+      runId,
+      step: "diagnostics",
+      name: `manual-diagnosis-${Date.now()}`,
+      message: "Diagnóstico de pantalla capturado.",
+      metadata: {
+        detectedScreen: screen.kind
+      }
+    });
+
+    await emitWorkerEvent({
+      runId,
+      eventType: "screen_diagnosis_completed",
+      step: "diagnostics",
+      message: "Diagnóstico de pantalla completado.",
+      metadata: {
+        detectedScreen: screen.kind
+      }
+    });
+  } finally {
+    await browser.close();
   }
 }

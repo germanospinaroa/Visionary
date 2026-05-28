@@ -67,6 +67,12 @@ type StartRunResponse = {
   message: string;
 };
 
+type BasicActionResponse = {
+  ok?: boolean;
+  message?: string;
+  error?: string;
+};
+
 function formatTimestamp(value: string | null | undefined) {
   if (!value) {
     return "n/a";
@@ -131,6 +137,10 @@ function getOperationalStep(step: string | null, questionIndex: number | null) {
     return "Abriendo primera pregunta";
   }
 
+  if (step === "diagnostics") {
+    return "Diagnosticando pantalla";
+  }
+
   if (step === "extracting_images") {
     return "Descargando imágenes";
   }
@@ -189,6 +199,7 @@ export function PilotRunner() {
   const [errorNotice, setErrorNotice] = useState<string | null>(null);
   const [selectorDrafts, setSelectorDrafts] = useState<Record<string, string>>({});
   const [isSavingSelectors, setIsSavingSelectors] = useState(false);
+  const [isDiagnosing, setIsDiagnosing] = useState(false);
   const [selectorDraftsRunId, setSelectorDraftsRunId] = useState<string | null>(null);
 
   useEffect(() => {
@@ -234,10 +245,7 @@ export function PilotRunner() {
             storeCodeInputSelectors: (payload.run.browser_config?.selectors?.storeCodeInputSelectors ?? []).join("\n"),
             validatorCodeInputSelectors: (payload.run.browser_config?.selectors?.validatorCodeInputSelectors ?? []).join("\n"),
             entryButtonSelectors: (payload.run.browser_config?.selectors?.entryButtonSelectors ?? []).join("\n"),
-            startSurveyButtonSelectors: (payload.run.browser_config?.selectors?.startSurveyButtonSelectors ?? []).join("\n"),
-            nextButtonSelectors: (payload.run.browser_config?.selectors?.nextButtonSelectors ?? []).join("\n"),
-            imageSelectors: (payload.run.browser_config?.selectors?.imageSelectors ?? []).join("\n"),
-            optionContainerSelectors: (payload.run.browser_config?.selectors?.optionContainerSelectors ?? []).join("\n")
+            startSurveyButtonSelectors: (payload.run.browser_config?.selectors?.startSurveyButtonSelectors ?? []).join("\n")
           });
           setSelectorDraftsRunId(payload.run.id);
         }
@@ -398,6 +406,38 @@ export function PilotRunner() {
     }
   }
 
+  async function onDiagnoseScreen() {
+    if (!activeRunId) {
+      return;
+    }
+
+    setIsDiagnosing(true);
+    setErrorNotice(null);
+
+    try {
+      const response = await fetch(`/api/pilot-runs/${activeRunId}`, {
+        method: "POST",
+        headers: {
+          "content-type": "application/json"
+        },
+        body: JSON.stringify({
+          action: "diagnose"
+        })
+      });
+      const payload = (await response.json()) as BasicActionResponse;
+
+      if (!response.ok) {
+        throw new Error(payload.error ?? payload.message ?? "No se pudo ejecutar el diagnóstico.");
+      }
+
+      setStatusNotice(payload.message ?? "Diagnóstico ejecutado.");
+    } catch (error) {
+      setErrorNotice(error instanceof Error ? error.message : "No se pudo ejecutar el diagnóstico.");
+    } finally {
+      setIsDiagnosing(false);
+    }
+  }
+
   return (
     <section className="pilot-console">
       <header className="pilot-hero">
@@ -452,6 +492,14 @@ export function PilotRunner() {
             </button>
             <button className="button secondary danger" type="button" onClick={onStop} disabled={!activeRunId || isStopping}>
               {isStopping ? "Deteniendo…" : "Detener"}
+            </button>
+            <button
+              className="button secondary"
+              type="button"
+              onClick={onDiagnoseScreen}
+              disabled={!activeRunId || isDiagnosing}
+            >
+              {isDiagnosing ? "Diagnosticando…" : "Diagnosticar pantalla actual"}
             </button>
           </div>
 
@@ -570,7 +618,7 @@ export function PilotRunner() {
             </p>
             <div className="advanced-grid">
               <div className="field">
-                <label htmlFor="storeSelectors">Selectors store code</label>
+                <label htmlFor="storeSelectors">Selector campo tienda</label>
                 <textarea
                   id="storeSelectors"
                   value={selectorDrafts.storeCodeInputSelectors ?? ""}
@@ -580,17 +628,7 @@ export function PilotRunner() {
                 />
               </div>
               <div className="field">
-                <label htmlFor="validatorSelectors">Selectors validator code</label>
-                <textarea
-                  id="validatorSelectors"
-                  value={selectorDrafts.validatorCodeInputSelectors ?? ""}
-                  onChange={(event) =>
-                    setSelectorDrafts((current) => ({ ...current, validatorCodeInputSelectors: event.target.value }))
-                  }
-                />
-              </div>
-              <div className="field">
-                <label htmlFor="entrySelectors">Selectors botón Entrar</label>
+                <label htmlFor="entrySelectors">Selector botón Entrar</label>
                 <textarea
                   id="entrySelectors"
                   value={selectorDrafts.entryButtonSelectors ?? ""}
@@ -600,42 +638,22 @@ export function PilotRunner() {
                 />
               </div>
               <div className="field">
-                <label htmlFor="startSurveySelectors">Selectors Iniciar encuesta</label>
+                <label htmlFor="validatorSelectors">Selector campo validador</label>
+                <textarea
+                  id="validatorSelectors"
+                  value={selectorDrafts.validatorCodeInputSelectors ?? ""}
+                  onChange={(event) =>
+                    setSelectorDrafts((current) => ({ ...current, validatorCodeInputSelectors: event.target.value }))
+                  }
+                />
+              </div>
+              <div className="field">
+                <label htmlFor="startSurveySelectors">Selector botón iniciar encuesta</label>
                 <textarea
                   id="startSurveySelectors"
                   value={selectorDrafts.startSurveyButtonSelectors ?? ""}
                   onChange={(event) =>
                     setSelectorDrafts((current) => ({ ...current, startSurveyButtonSelectors: event.target.value }))
-                  }
-                />
-              </div>
-              <div className="field">
-                <label htmlFor="nextSelectors">Selectors botón siguiente</label>
-                <textarea
-                  id="nextSelectors"
-                  value={selectorDrafts.nextButtonSelectors ?? ""}
-                  onChange={(event) =>
-                    setSelectorDrafts((current) => ({ ...current, nextButtonSelectors: event.target.value }))
-                  }
-                />
-              </div>
-              <div className="field">
-                <label htmlFor="imageSelectors">Selectors imágenes</label>
-                <textarea
-                  id="imageSelectors"
-                  value={selectorDrafts.imageSelectors ?? ""}
-                  onChange={(event) =>
-                    setSelectorDrafts((current) => ({ ...current, imageSelectors: event.target.value }))
-                  }
-                />
-              </div>
-              <div className="field">
-                <label htmlFor="optionSelectors">Selectors opciones</label>
-                <textarea
-                  id="optionSelectors"
-                  value={selectorDrafts.optionContainerSelectors ?? ""}
-                  onChange={(event) =>
-                    setSelectorDrafts((current) => ({ ...current, optionContainerSelectors: event.target.value }))
                   }
                 />
               </div>
@@ -658,6 +676,9 @@ export function PilotRunner() {
                           ? `Selectores: ${event.details.selectorsUsed.join(", ")}`
                           : "Sin selector"}
                     </span>
+                    {typeof event.details?.fallbackUsed === "string" ? (
+                      <span className="timeline-step">Fallback: {event.details.fallbackUsed}</span>
+                    ) : null}
                   </article>
                 ))}
               </div>
@@ -680,6 +701,12 @@ export function PilotRunner() {
                 <span className="timeline-time">{formatTimestamp(event.created_at)}</span>
                 <strong>{event.message}</strong>
                 <span className="timeline-step">{event.details?.step?.replace(/_/g, " ") ?? "proceso"}</span>
+                {typeof event.details?.selectorUsed === "string" ? (
+                  <span className="timeline-step">Selector: {event.details.selectorUsed}</span>
+                ) : null}
+                {typeof event.details?.fallbackUsed === "string" ? (
+                  <span className="timeline-step">Fallback: {event.details.fallbackUsed}</span>
+                ) : null}
               </article>
             ))
           ) : (
