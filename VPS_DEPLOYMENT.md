@@ -1,63 +1,60 @@
-# VPS Ubuntu Deployment for `worker-service` on Hostinger
+# VPS Ubuntu Deployment with Docker + Traefik
 
-This guide deploys the persistent Playwright worker on an Ubuntu VPS using:
+This is the production path for the persistent Playwright worker on the VPS.
 
-- Node.js LTS
-- Playwright Chromium
-- PM2
-- Nginx reverse proxy
-- a dedicated subdomain such as `worker.tudominio.com`
+Use:
 
-The final goal is:
+- Docker
+- Docker Compose
+- existing Traefik instance
+- existing Docker network: `n8n_evoapi`
 
-- `https://visual-validator-mvp.vercel.app/pilot`
-- click `Ejecutar piloto`
-- Vercel calls the VPS worker API
-- the worker starts Playwright automatically
-- screenshots update in the Live Browser
+Do not use:
 
-## 1. DNS / domain
-
-Create a subdomain in Hostinger DNS:
-
-- `worker.tudominio.com` -> VPS public IP
-
-Use this subdomain for the worker API.
-
-## 2. Copy the app to the VPS
-
-Recommended target directory:
-
-```bash
-/var/www/visionary
-```
-
-Example:
-
-```bash
-sudo mkdir -p /var/www/visionary
-sudo chown -R $USER:$USER /var/www/visionary
-cd /var/www/visionary
-git clone <TU_REPO_GIT> .
-```
-
-## 3. Bootstrap Ubuntu
-
-Run:
-
-```bash
-chmod +x deploy/vps/setup-ubuntu.sh
-APP_DIR=/var/www/visionary ./deploy/vps/setup-ubuntu.sh
-```
-
-This installs:
-
-- Node.js 22.x
 - PM2
 - Nginx
-- Playwright Chromium + system dependencies
+- Cloudflare Tunnel
+- Railway
 
-## 4. Production environment file
+Final target:
+
+- `https://worker.germanospina.com/health`
+
+When this is healthy, Vercel can call:
+
+- `POST https://worker.germanospina.com/runs/start`
+
+and `Ejecutar piloto` from `https://visual-validator-mvp.vercel.app/pilot` will start the worker automatically.
+
+## 1. VPS assumptions
+
+This guide assumes the VPS already has:
+
+- Docker installed
+- Docker Compose plugin installed
+- Traefik running in Docker
+- Traefik listening on ports `80` and `443`
+- Let's Encrypt enabled in Traefik
+- Docker network `n8n_evoapi` already created and shared with Traefik
+
+## 2. Copy the project to the VPS
+
+Example target:
+
+```bash
+mkdir -p /opt/visionary
+cd /opt/visionary
+git clone https://github.com/germanospinaroa/Visionary.git .
+```
+
+For updates later:
+
+```bash
+cd /opt/visionary
+git pull origin main
+```
+
+## 3. Create the production env file
 
 Create:
 
@@ -65,7 +62,7 @@ Create:
 cp .env.production.example .env.production
 ```
 
-Fill:
+Fill at least:
 
 ```bash
 OPENAI_API_KEY=...
@@ -78,52 +75,97 @@ PILOT_RUN_TIMEOUT_MS=900000
 PILOT_SHUTDOWN_GRACE_MS=10000
 ```
 
-## 5. Start the worker with PM2
+## 4. Review the worker compose service
 
-The repo already includes:
+The repo includes:
 
-- `ecosystem.config.cjs`
+- `Dockerfile`
+- `docker-compose.worker.yml`
 
-Start it:
+The compose file already:
 
-```bash
-cd /var/www/visionary
-pm2 start ecosystem.config.cjs
-pm2 save
-pm2 startup
-```
+- builds the worker image
+- runs the service on internal port `4001`
+- sets `restart: always`
+- joins the external network `n8n_evoapi`
+- exposes Traefik labels for `worker.germanospina.com`
+- enables a Docker healthcheck against `/health`
 
-Run the command printed by `pm2 startup` so PM2 survives VPS reboots.
+## 5. Start the worker service
 
-## 6. Check logs
-
-PM2 logs:
-
-```bash
-pm2 logs visionary-worker-service
-```
-
-Status:
+From the repo root:
 
 ```bash
-pm2 status
+docker compose -f docker-compose.worker.yml up -d --build
 ```
 
-Restart manually:
+If you want to rebuild after changes:
 
 ```bash
-pm2 restart visionary-worker-service
+docker compose -f docker-compose.worker.yml up -d --build --force-recreate
 ```
 
-## 7. Validate local healthcheck before Nginx
+## 6. Confirm the container is running
 
-On the VPS:
+```bash
+docker compose -f docker-compose.worker.yml ps
+```
+
+Expected service name:
+
+- `worker-service`
+
+Container name:
+
+- `visionary-worker-service`
+
+## 7. Check logs
+
+Live logs:
+
+```bash
+docker compose -f docker-compose.worker.yml logs -f worker-service
+```
+
+Recent logs only:
+
+```bash
+docker logs --tail=200 visionary-worker-service
+```
+
+Restart:
+
+```bash
+docker compose -f docker-compose.worker.yml restart worker-service
+```
+
+Stop:
+
+```bash
+docker compose -f docker-compose.worker.yml down
+```
+
+## 8. Validate local container health
+
+Check Docker health:
+
+```bash
+docker inspect --format='{{json .State.Health}}' visionary-worker-service
+```
+
+Test from inside the VPS host:
 
 ```bash
 curl http://127.0.0.1:4001/health
 ```
 
-Expected:
+If the service is not bound to the host, test through Docker:
+
+```bash
+docker exec visionary-worker-service node -e "fetch('http://127.0.0.1:4001/health').then(async (res) => console.log(await res.text()))"
+```
+
+Expected shape:
 
 ```json
 {
@@ -137,61 +179,50 @@ Expected:
 }
 ```
 
-You can also use:
+## 9. Confirm Traefik labels are applied
 
-```bash
-npm run pilot:service:health
+The compose file already includes:
+
+```yaml
+labels:
+  traefik.enable: "true"
+  traefik.docker.network: "n8n_evoapi"
+  traefik.http.routers.worker.rule: "Host(`worker.germanospina.com`)"
+  traefik.http.routers.worker.entrypoints: "websecure"
+  traefik.http.routers.worker.tls.certresolver: "mytlschallenge"
+  traefik.http.services.worker.loadbalancer.server.port: "4001"
 ```
 
-## 8. Configure Nginx reverse proxy
+That is what makes Traefik publish:
 
-Copy the provided template:
+- `https://worker.germanospina.com`
 
-```bash
-sudo cp deploy/vps/nginx-worker.conf /etc/nginx/sites-available/visionary-worker
-```
+without Nginx, PM2 or tunnels.
 
-Edit:
+## 10. Validate public HTTPS
 
-```nginx
-server_name worker.tudominio.com;
-```
-
-Enable the site:
+Once the container is up and Traefik sees it:
 
 ```bash
-sudo ln -s /etc/nginx/sites-available/visionary-worker /etc/nginx/sites-enabled/visionary-worker
-sudo nginx -t
-sudo systemctl reload nginx
+curl https://worker.germanospina.com/health
 ```
 
-## 9. Enable HTTPS
+This must return valid JSON from the worker service.
 
-Recommended with Certbot:
+If it does not:
 
-```bash
-sudo apt-get install -y certbot python3-certbot-nginx
-sudo certbot --nginx -d worker.tudominio.com
-```
+1. inspect container logs
+2. inspect Traefik logs
+3. confirm DNS for `worker.germanospina.com` points to the VPS
+4. confirm Traefik is attached to `n8n_evoapi`
+5. confirm the worker container is attached to `n8n_evoapi`
 
-After this, validate:
+## 11. Connect Vercel to the VPS worker
 
-```bash
-curl https://worker.tudominio.com/health
-```
-
-## 10. Connect Vercel to the VPS worker
-
-In Vercel Production environment variables, set:
+In Vercel production variables:
 
 ```bash
-PILOT_WORKER_API_BASE_URL=https://worker.tudominio.com
-```
-
-CLI option:
-
-```bash
-npx vercel env add PILOT_WORKER_API_BASE_URL production
+PILOT_WORKER_API_BASE_URL=https://worker.germanospina.com
 ```
 
 Then redeploy Vercel:
@@ -200,59 +231,45 @@ Then redeploy Vercel:
 npx vercel --prod
 ```
 
-## 11. Validate the full chain
+## 12. Validate end-to-end execution
 
-### From Vercel to VPS
+After the VPS worker and Vercel are both configured:
 
-After redeploy, the `/pilot` page will call:
+1. open `https://visual-validator-mvp.vercel.app/pilot`
+2. click `Ejecutar piloto`
+3. Vercel should create the run
+4. Vercel should call `POST /runs/start` on the VPS worker
+5. the worker should start Playwright automatically
+6. screenshots should begin updating in `Live Browser`
 
-```bash
-POST https://worker.tudominio.com/runs/start
-```
+## 13. Operating commands
 
-### Direct endpoint test
-
-```bash
-curl -X POST https://worker.tudominio.com/runs/start \
-  -H "content-type: application/json" \
-  -d '{"runId":"TEST_RUN_ID"}'
-```
-
-### Live Browser expectation
-
-When a real run starts:
-
-- Playwright launches on the VPS
-- screenshots upload to Supabase Storage
-- `survey_runs.current_screenshot_*` updates
-- `/pilot` refreshes the image automatically
-
-## 12. Regular deployment updates
-
-For later updates on the VPS:
+Build and start:
 
 ```bash
-chmod +x deploy/vps/deploy-worker.sh
-APP_DIR=/var/www/visionary BRANCH=main ./deploy/vps/deploy-worker.sh
+docker compose -f docker-compose.worker.yml up -d --build
 ```
 
-## 13. Operational notes
+View logs:
 
-- PM2 provides auto-restart.
-- Nginx provides stable public routing.
-- `/health` verifies service status plus Supabase/OpenAI connectivity.
-- run timeout is controlled by `PILOT_RUN_TIMEOUT_MS`.
-- concurrency is limited by `PILOT_MAX_CONCURRENT_RUNS`.
-- structured logs are emitted to stdout/stderr and visible in PM2 logs.
+```bash
+docker compose -f docker-compose.worker.yml logs -f worker-service
+```
 
-## 14. What must be true for `Ejecutar piloto` to work
+Restart:
 
-All of these must be correct:
+```bash
+docker compose -f docker-compose.worker.yml restart worker-service
+```
 
-1. VPS worker is running under PM2
-2. `https://worker.tudominio.com/health` returns `ok: true`
-3. Vercel has `PILOT_WORKER_API_BASE_URL=https://worker.tudominio.com`
-4. Vercel is redeployed after setting the variable
-5. Supabase and OpenAI variables are valid on the VPS
+Stop and remove:
 
-Once those are satisfied, `Ejecutar piloto` from Vercel will start the worker automatically.
+```bash
+docker compose -f docker-compose.worker.yml down
+```
+
+Health:
+
+```bash
+curl https://worker.germanospina.com/health
+```

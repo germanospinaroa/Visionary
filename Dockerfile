@@ -1,6 +1,8 @@
 FROM node:22-bookworm
 
+ENV NODE_ENV=production
 ENV PLAYWRIGHT_BROWSERS_PATH=/ms-playwright
+ENV PILOT_WORKER_API_PORT=4001
 
 WORKDIR /app
 
@@ -11,7 +13,7 @@ RUN npx playwright install --with-deps chromium
 
 COPY . .
 
-ENV NODE_ENV=production
+RUN npm run build
 
 EXPOSE 4001
 

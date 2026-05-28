@@ -1,0 +1,37 @@
+services:
+  worker-service:
+    container_name: visionary-worker-service
+    build:
+      context: .
+      dockerfile: Dockerfile
+    restart: always
+    env_file:
+      - .env.production
+    environment:
+      NODE_ENV: production
+      PILOT_WORKER_API_PORT: 4001
+    expose:
+      - "4001"
+    healthcheck:
+      test:
+        - CMD
+        - node
+        - -e
+        - fetch('http://127.0.0.1:4001/health').then((res)=>process.exit(res.ok?0:1)).catch(()=>process.exit(1))
+      interval: 30s
+      timeout: 10s
+      start_period: 45s
+      retries: 3
+    labels:
+      traefik.enable: "true"
+      traefik.docker.network: "n8n_evoapi"
+      traefik.http.routers.worker.rule: "Host(`worker.germanospina.com`)"
+      traefik.http.routers.worker.entrypoints: "websecure"
+      traefik.http.routers.worker.tls.certresolver: "mytlschallenge"
+      traefik.http.services.worker.loadbalancer.server.port: "4001"
+    networks:
+      - n8n_evoapi
+
+networks:
+  n8n_evoapi:
+    external: true
