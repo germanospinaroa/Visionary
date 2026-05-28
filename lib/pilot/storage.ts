@@ -8,6 +8,8 @@ type StorageTraceContext = {
   sourceUrl?: string;
   contentType?: string;
   functionName?: string;
+  artifactType?: string;
+  fileName?: string;
 };
 
 function logStorageTrace(
@@ -26,6 +28,8 @@ function logStorageTrace(
     currentStep: context.currentStep ?? null,
     sourceUrl: context.sourceUrl ?? null,
     contentType: context.contentType ?? null,
+    artifactType: context.artifactType ?? null,
+    fileName: context.fileName ?? null,
     errorMessage: error instanceof Error ? error.message : null,
     errorStack: error instanceof Error ? error.stack ?? null : null,
     timestamp: new Date().toISOString()
@@ -97,16 +101,23 @@ export async function uploadJsonArtifact({
 }) {
   const buffer = Buffer.from(JSON.stringify(payload, null, 2), "utf8");
   const filePath = path.posix.join("runs", runId, "artifacts", `${name}.json`);
+  const nextTraceContext = {
+    ...traceContext,
+    runId,
+    functionName: "uploadJsonArtifact",
+    artifactType: "json_artifact",
+    fileName: filePath,
+    contentType: "application/json"
+  };
+
+  logStorageTrace("info", "uploadJsonArtifact", "uploadBufferToStorage:caller", nextTraceContext);
 
   await uploadBufferToStorage({
     bucket: STORAGE_BUCKETS.analysisArtifacts,
     filePath,
     buffer,
     contentType: "application/json",
-    traceContext: {
-      ...traceContext,
-      runId
-    }
+    traceContext: nextTraceContext
   });
 
   return {

@@ -176,14 +176,43 @@ function buildWorkerTraceContext(
   extra?: {
     sourceUrl?: string;
     contentType?: string;
+    artifactType?: string;
+    fileName?: string;
+    functionName?: string;
   }
 ) {
   return {
     runId,
     currentStep,
     sourceUrl: extra?.sourceUrl,
-    contentType: extra?.contentType
+    contentType: extra?.contentType,
+    artifactType: extra?.artifactType,
+    fileName: extra?.fileName,
+    functionName: extra?.functionName
   };
+}
+
+function logUploadCall(traceContext: {
+  runId: string;
+  currentStep: string;
+  functionName: string;
+  artifactType: string;
+  contentType: string;
+  fileName: string;
+}) {
+  console.log(
+    JSON.stringify({
+      scope: "lib/pilot/worker",
+      event: "uploadBufferToStorage:caller",
+      callerFunction: traceContext.functionName,
+      artifactType: traceContext.artifactType,
+      mime: traceContext.contentType,
+      filename: traceContext.fileName,
+      currentStep: traceContext.currentStep,
+      runId: traceContext.runId,
+      timestamp: new Date().toISOString()
+    })
+  );
 }
 
 function serializeUnknownError(error: unknown, seen = new WeakSet<object>()): SerializedError {
@@ -415,15 +444,28 @@ async function uploadHtmlArtifact({
   step?: string;
 }) {
   const filePath = buildHtmlArtifactPath(runId, name);
+  const traceContext = buildWorkerTraceContext(runId, step ?? "unknown", {
+    contentType: "text/html; charset=utf-8",
+    artifactType: "html_artifact",
+    fileName: filePath,
+    functionName: "uploadHtmlArtifact"
+  });
+
+  logUploadCall({
+    runId,
+    currentStep: step ?? "unknown",
+    functionName: "uploadHtmlArtifact",
+    artifactType: "html_artifact",
+    contentType: "text/html; charset=utf-8",
+    fileName: filePath
+  });
 
   await uploadBufferToStorage({
     bucket: STORAGE_BUCKETS.analysisArtifacts,
     filePath,
     buffer: Buffer.from(html, "utf8"),
     contentType: "text/html; charset=utf-8",
-    traceContext: buildWorkerTraceContext(runId, step ?? "unknown", {
-      contentType: "text/html; charset=utf-8"
-    })
+    traceContext
   });
 
   return {
@@ -997,15 +1039,28 @@ async function captureAndUploadScreenshot({
     type: "png"
   });
   const storagePath = path.posix.join("runs", runId, "screenshots", fileName);
+  const traceContext = buildWorkerTraceContext(runId, step ?? "unknown", {
+    contentType: "image/png",
+    artifactType: "screenshot",
+    fileName: storagePath,
+    functionName: "captureAndUploadScreenshot"
+  });
+
+  logUploadCall({
+    runId,
+    currentStep: step ?? "unknown",
+    functionName: "captureAndUploadScreenshot",
+    artifactType: "screenshot",
+    contentType: "image/png",
+    fileName: storagePath
+  });
 
   await uploadBufferToStorage({
     bucket,
     filePath: storagePath,
     buffer,
     contentType: "image/png",
-    traceContext: buildWorkerTraceContext(runId, step ?? "unknown", {
-      contentType: "image/png"
-    })
+    traceContext
   });
 
   return {
@@ -1146,15 +1201,28 @@ async function captureRawInitialScreenshot({
       type: "png"
     });
     const storagePath = path.posix.join("runs", runId, "raw-initial", `${Date.now()}-${safeAction}.png`);
+    const traceContext = buildWorkerTraceContext(runId, step, {
+      contentType: "image/png",
+      artifactType: "raw_initial_screenshot",
+      fileName: storagePath,
+      functionName: "captureRawInitialScreenshot"
+    });
+
+    logUploadCall({
+      runId,
+      currentStep: step,
+      functionName: "captureRawInitialScreenshot",
+      artifactType: "raw_initial_screenshot",
+      contentType: "image/png",
+      fileName: storagePath
+    });
 
     await uploadBufferToStorage({
       bucket: STORAGE_BUCKETS.analysisArtifacts,
       filePath: storagePath,
       buffer,
       contentType: "image/png",
-      traceContext: buildWorkerTraceContext(runId, step, {
-        contentType: "image/png"
-      })
+      traceContext
     });
 
     await setCurrentBrowserScreenshot({
@@ -1220,15 +1288,28 @@ function startLiveBrowserView({
         type: "png"
       });
       const storagePath = path.posix.join("runs", runId, "live", "current.png");
+      const traceContext = buildWorkerTraceContext(runId, "live_browser", {
+        contentType: "image/png",
+        artifactType: "live_browser_screenshot",
+        fileName: storagePath,
+        functionName: "startLiveBrowserView"
+      });
+
+      logUploadCall({
+        runId,
+        currentStep: "live_browser",
+        functionName: "startLiveBrowserView",
+        artifactType: "live_browser_screenshot",
+        contentType: "image/png",
+        fileName: storagePath
+      });
 
       await uploadBufferToStorage({
         bucket: STORAGE_BUCKETS.analysisArtifacts,
         filePath: storagePath,
         buffer,
         contentType: "image/png",
-        traceContext: buildWorkerTraceContext(runId, "live_browser", {
-          contentType: "image/png"
-        })
+        traceContext
       });
 
       await setCurrentBrowserScreenshot({
@@ -1358,16 +1439,29 @@ async function persistExtractedImage(runId: string, sourceUrl: string, index: nu
   const remote = await fetchBinaryImage(sourceUrl, buildWorkerTraceContext(runId, currentStep, { sourceUrl }));
   const extension = remote.mimeType.split("/")[1] ?? "jpg";
   const storagePath = path.posix.join("runs", runId, "source-images", `image-${index + 1}.${extension}`);
+  const traceContext = buildWorkerTraceContext(runId, currentStep, {
+    sourceUrl,
+    contentType: remote.mimeType,
+    artifactType: "source_image",
+    fileName: storagePath,
+    functionName: "persistExtractedImage"
+  });
+
+  logUploadCall({
+    runId,
+    currentStep,
+    functionName: "persistExtractedImage",
+    artifactType: "source_image",
+    contentType: remote.mimeType,
+    fileName: storagePath
+  });
 
   await uploadBufferToStorage({
     bucket: STORAGE_BUCKETS.surveyImages,
     filePath: storagePath,
     buffer: remote.buffer,
     contentType: remote.mimeType,
-    traceContext: buildWorkerTraceContext(runId, currentStep, {
-      sourceUrl,
-      contentType: remote.mimeType
-    })
+    traceContext
   });
 
   const imageRecordId = await createImageRecord({
@@ -2580,7 +2674,26 @@ export async function runPilotSurvey(runId: string) {
 
     const serializedError = serializeUnknownError(normalizedError);
     const htmlPartial = await page.content().then((content) => content.slice(0, 50_000)).catch(() => "");
-    const htmlArtifact = htmlPartial
+    const shouldSkipHtmlArtifactUpload = (runtimeState.currentStep || normalizedError.step) === "opening_survey";
+
+    if (htmlPartial && shouldSkipHtmlArtifactUpload) {
+      console.warn(
+        JSON.stringify({
+          scope: "lib/pilot/worker",
+          event: "uploadHtmlArtifact:skipped",
+          callerFunction: "runPilotSurvey.catch",
+          artifactType: "html_artifact",
+          mime: "text/html; charset=utf-8",
+          filename: `fatal-error-${Date.now()}.html`,
+          currentStep: runtimeState.currentStep || normalizedError.step,
+          runId,
+          reason: "skip_html_artifact_upload_during_opening_survey",
+          timestamp: new Date().toISOString()
+        })
+      );
+    }
+
+    const htmlArtifact = htmlPartial && !shouldSkipHtmlArtifactUpload
       ? await uploadHtmlArtifact({
           runId,
           name: `fatal-error-${Date.now()}`,
