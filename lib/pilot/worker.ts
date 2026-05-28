@@ -1047,6 +1047,71 @@ async function captureActionScreenshot({
   return screenshot;
 }
 
+async function captureRawInitialScreenshot({
+  page,
+  runId,
+  step,
+  action,
+  message,
+  metadata = {}
+}: {
+  page: Page;
+  runId: string;
+  step: string;
+  action: string;
+  message: string;
+  metadata?: Record<string, unknown>;
+}) {
+  try {
+    const safeAction = action.replace(/[^a-z0-9-_]+/gi, "-").toLowerCase();
+    const buffer = await page.screenshot({
+      fullPage: true,
+      type: "png"
+    });
+    const storagePath = path.posix.join("runs", runId, "raw-initial", `${Date.now()}-${safeAction}.png`);
+
+    await uploadBufferToStorage({
+      bucket: STORAGE_BUCKETS.analysisArtifacts,
+      filePath: storagePath,
+      buffer,
+      contentType: "image/png"
+    });
+
+    await setCurrentBrowserScreenshot({
+      runId,
+      bucket: STORAGE_BUCKETS.analysisArtifacts,
+      storagePath
+    });
+
+    await emitWorkerEvent({
+      runId,
+      eventType: "raw_browser_screenshot_saved",
+      step,
+      message,
+      metadata: {
+        action,
+        screenshotMode: "raw_playwright_png",
+        ...metadata
+      },
+      screenshotBucket: STORAGE_BUCKETS.analysisArtifacts,
+      screenshotPath: storagePath
+    });
+  } catch (error) {
+    await emitWorkerEvent({
+      runId,
+      level: "warn",
+      eventType: "raw_browser_screenshot_failed",
+      step,
+      message: "El screenshot RAW falló, pero el flujo Playwright continúa.",
+      metadata: {
+        action,
+        screenshotMode: "raw_playwright_png",
+        detail: error instanceof Error ? error.message : "unknown_screenshot_error"
+      }
+    }).catch(() => null);
+  }
+}
+
 function startLiveBrowserView({
   page,
   runId
@@ -1277,7 +1342,6 @@ export async function runPilotSurvey(runId: string) {
   const context = await browser.newContext();
   const page = await context.newPage();
   const browserSessionId = randomUUID();
-  let stopLiveBrowserView: (() => void) | null = null;
 
   try {
     await updateSurveyRun(runId, {
@@ -1297,9 +1361,34 @@ export async function runPilotSurvey(runId: string) {
       }
     });
 
-    stopLiveBrowserView = startLiveBrowserView({
-      page,
-      runId
+    await emitWorkerEvent({
+      runId,
+      level: "warn",
+      eventType: "live_browser_disabled",
+      step: "initial_screen",
+      message: "Live browser disabled.",
+      metadata: {
+        reason: "initial_phase_isolated"
+      }
+    });
+    await emitWorkerEvent({
+      runId,
+      level: "warn",
+      eventType: "visual_pipeline_skipped",
+      step: "initial_screen",
+      message: "Visual pipeline skipped.",
+      metadata: {
+        phase: "initial_screen"
+      }
+    });
+    await emitWorkerEvent({
+      runId,
+      eventType: "raw_screenshot_mode_enabled",
+      step: "initial_screen",
+      message: "Using raw Playwright screenshot.",
+      metadata: {
+        phase: "initial_screen"
+      }
     });
 
     await emitWorkerEvent({
@@ -1311,7 +1400,7 @@ export async function runPilotSurvey(runId: string) {
         surveyUrl
       }
     });
-    await captureActionScreenshot({
+    await captureRawInitialScreenshot({
       page,
       runId,
       step: "opening_survey",
@@ -1322,7 +1411,7 @@ export async function runPilotSurvey(runId: string) {
     await page.goto(surveyUrl, {
       waitUntil: "networkidle"
     });
-    await captureActionScreenshot({
+    await captureRawInitialScreenshot({
       page,
       runId,
       step: "opening_survey",
@@ -1383,7 +1472,7 @@ export async function runPilotSurvey(runId: string) {
         storeCode
       }
     });
-    await captureActionScreenshot({
+    await captureRawInitialScreenshot({
       page,
       runId,
       step: "initial_screen",
@@ -1487,7 +1576,7 @@ export async function runPilotSurvey(runId: string) {
         step: "initial_screen"
       });
 
-      await captureActionScreenshot({
+      await captureRawInitialScreenshot({
         page,
         runId,
         step: "initial_screen",
@@ -1565,7 +1654,7 @@ export async function runPilotSurvey(runId: string) {
         context: "entry_screen"
       }
     });
-    await captureActionScreenshot({
+    await captureRawInitialScreenshot({
       page,
       runId,
       step: "initial_screen",
@@ -1637,7 +1726,7 @@ export async function runPilotSurvey(runId: string) {
         }
       });
       const clickResult = await tryClickEntryButton(entryButtonMatch.locator, storeCodeMatch.locator, page);
-      await captureActionScreenshot({
+      await captureRawInitialScreenshot({
         page,
         runId,
         step: "initial_screen",
@@ -1716,7 +1805,7 @@ export async function runPilotSurvey(runId: string) {
       );
     }
 
-    await captureActionScreenshot({
+    await captureRawInitialScreenshot({
       page,
       runId,
       step: "validator_screen",
@@ -2527,7 +2616,6 @@ export async function runPilotSurvey(runId: string) {
 
     throw normalizedError;
   } finally {
-    stopLiveBrowserView?.();
     await browser.close();
     await getSurveyRunDetails(runId).catch(() => null);
   }
