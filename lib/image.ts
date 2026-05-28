@@ -93,7 +93,7 @@ function extractImageCandidates(html: string, baseUrl: string) {
   return [...new Set(candidates)];
 }
 
-async function fetchBinaryImage(url: string) {
+export async function fetchBinaryImage(url: string) {
   const response = await fetchUrl(url);
 
   if (!response.ok) {

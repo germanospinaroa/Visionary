@@ -3,7 +3,7 @@ import { randomUUID } from "node:crypto";
 import path from "node:path";
 import { createSupabaseAdminClient } from "@/lib/supabase/admin";
 import { STORAGE_BUCKETS } from "@/lib/supabase/storage";
-import { fetchRemoteImage } from "@/lib/image";
+import { fetchBinaryImage } from "@/lib/image";
 import { runVisualAnalysis } from "@/lib/analysis/run-visual-analysis";
 import {
   createBrowserEvent,
@@ -18,15 +18,45 @@ import { mergePilotBrowserConfig } from "@/lib/pilot/config";
 import type { ExtractedSurveyImage, SurveySelectorConfig } from "@/lib/pilot/types";
 
 class PilotFlowError extends Error {
+  readonly details?: Record<string, unknown>;
+  readonly debugContext?: Record<string, unknown>;
+
   constructor(
     message: string,
     readonly runStatus: "failed" | "needs_selector_calibration" | "human_review",
-    readonly step: string
+    readonly step: string,
+    options?: {
+      cause?: unknown;
+      details?: Record<string, unknown>;
+      debugContext?: Record<string, unknown>;
+    }
   ) {
     super(message);
     this.name = "PilotFlowError";
+    this.details = options?.details;
+    this.debugContext = options?.debugContext;
+
+    if (options?.cause !== undefined) {
+      (this as Error & { cause?: unknown }).cause = options.cause;
+    }
   }
 }
+
+type SerializedError = {
+  message: string;
+  stack: string | null;
+  name: string;
+  cause: unknown;
+  playwright: Record<string, unknown> | null;
+};
+
+type WorkerRuntimeState = {
+  currentStep: string;
+  lastSelector: string | null;
+  lastScreenshotPath: string | null;
+  currentUrl: string | null;
+  currentTitle: string | null;
+};
 
 type VisibleMatch = {
   locator: Locator;
@@ -138,6 +168,97 @@ function normalizeText(value: string) {
 
 function buildHtmlArtifactPath(runId: string, name: string) {
   return path.posix.join("runs", runId, "artifacts", `${name}.html`);
+}
+
+function serializeUnknownError(error: unknown, seen = new WeakSet<object>()): SerializedError {
+  if (error instanceof Error) {
+    return {
+      message: error.message || String(error),
+      stack: error.stack ?? null,
+      name: error.name || "Error",
+      cause: serializeErrorCause((error as Error & { cause?: unknown }).cause, seen),
+      playwright: serializePlaywrightError(error)
+    };
+  }
+
+  return {
+    message: typeof error === "string" ? error : "Unknown error",
+    stack: null,
+    name: typeof error,
+    cause: serializeErrorCause(error, seen),
+    playwright: null
+  };
+}
+
+function serializeErrorCause(value: unknown, seen = new WeakSet<object>()): unknown {
+  if (value === null || value === undefined) {
+    return null;
+  }
+
+  if (typeof value === "string" || typeof value === "number" || typeof value === "boolean") {
+    return value;
+  }
+
+  if (value instanceof Error) {
+    if (seen.has(value)) {
+      return {
+        name: value.name,
+        message: value.message,
+        circular: true
+      };
+    }
+
+    seen.add(value);
+    return {
+      name: value.name,
+      message: value.message,
+      stack: value.stack ?? null,
+      cause: serializeErrorCause((value as Error & { cause?: unknown }).cause, seen)
+    };
+  }
+
+  if (typeof value === "object") {
+    if (seen.has(value)) {
+      return "[Circular]";
+    }
+
+    seen.add(value);
+
+    if (Array.isArray(value)) {
+      return value.map((item) => serializeErrorCause(item, seen));
+    }
+
+    return Object.fromEntries(
+      Object.entries(value).map(([key, nestedValue]) => [key, serializeErrorCause(nestedValue, seen)])
+    );
+  }
+
+  return String(value);
+}
+
+function serializePlaywrightError(error: Error) {
+  const candidate = error as Error & {
+    timeout?: number;
+    method?: string;
+    logs?: string;
+    apiName?: string;
+    value?: unknown;
+  };
+
+  const payload = {
+    timeout: typeof candidate.timeout === "number" ? candidate.timeout : null,
+    method: typeof candidate.method === "string" ? candidate.method : null,
+    apiName: typeof candidate.apiName === "string" ? candidate.apiName : null,
+    logs: typeof candidate.logs === "string" ? candidate.logs : null,
+    value: candidate.value !== undefined ? serializeErrorCause(candidate.value) : null
+  };
+
+  return Object.values(payload).some((value) => value !== null) ? payload : null;
+}
+
+async function refreshRuntimePageState(state: WorkerRuntimeState, page: Page) {
+  state.currentUrl = page.url();
+  state.currentTitle = await page.title().catch(() => state.currentTitle ?? "");
 }
 
 async function firstVisible(page: Page, selectors: string[]): Promise<VisibleMatch | null> {
@@ -924,7 +1045,8 @@ async function captureActionScreenshot({
   step,
   action,
   message,
-  metadata = {}
+  metadata = {},
+  runtimeState
 }: {
   page: Page;
   runId: string;
@@ -932,6 +1054,7 @@ async function captureActionScreenshot({
   action: string;
   message: string;
   metadata?: Record<string, unknown>;
+  runtimeState?: WorkerRuntimeState;
 }) {
   const safeAction = action.replace(/[^a-z0-9-_]+/gi, "-").toLowerCase();
   const fileName = `live-${Date.now()}-${safeAction}.png`;
@@ -947,6 +1070,12 @@ async function captureActionScreenshot({
     bucket: STORAGE_BUCKETS.analysisArtifacts,
     storagePath: screenshot.storagePath
   });
+
+  if (runtimeState) {
+    runtimeState.currentStep = step;
+    runtimeState.lastScreenshotPath = screenshot.storagePath;
+    await refreshRuntimePageState(runtimeState, page).catch(() => null);
+  }
 
   await emitWorkerEvent({
     runId,
@@ -970,7 +1099,8 @@ async function captureRawInitialScreenshot({
   step,
   action,
   message,
-  metadata = {}
+  metadata = {},
+  runtimeState
 }: {
   page: Page;
   runId: string;
@@ -978,6 +1108,7 @@ async function captureRawInitialScreenshot({
   action: string;
   message: string;
   metadata?: Record<string, unknown>;
+  runtimeState?: WorkerRuntimeState;
 }) {
   try {
     const safeAction = action.replace(/[^a-z0-9-_]+/gi, "-").toLowerCase();
@@ -999,6 +1130,12 @@ async function captureRawInitialScreenshot({
       bucket: STORAGE_BUCKETS.analysisArtifacts,
       storagePath
     });
+
+    if (runtimeState) {
+      runtimeState.currentStep = step;
+      runtimeState.lastScreenshotPath = storagePath;
+      await refreshRuntimePageState(runtimeState, page).catch(() => null);
+    }
 
     await emitWorkerEvent({
       runId,
@@ -1183,7 +1320,7 @@ async function selectUsedImages(page: Page, selectors: SurveySelectorConfig, use
 }
 
 async function persistExtractedImage(runId: string, sourceUrl: string, index: number) {
-  const remote = await fetchRemoteImage(sourceUrl);
+  const remote = await fetchBinaryImage(sourceUrl);
   const extension = remote.mimeType.split("/")[1] ?? "jpg";
   const storagePath = path.posix.join("runs", runId, "source-images", `image-${index + 1}.${extension}`);
 
@@ -1259,6 +1396,13 @@ export async function runPilotSurvey(runId: string) {
   const context = await browser.newContext();
   const page = await context.newPage();
   const browserSessionId = randomUUID();
+  const runtimeState: WorkerRuntimeState = {
+    currentStep: "browser_launch",
+    lastSelector: null,
+    lastScreenshotPath: null,
+    currentUrl: null,
+    currentTitle: null
+  };
 
   try {
     await updateSurveyRun(runId, {
@@ -1322,18 +1466,22 @@ export async function runPilotSurvey(runId: string) {
       runId,
       step: "opening_survey",
       action: "before-open-survey",
-      message: "Vista inicial antes de abrir la encuesta."
+      message: "Vista inicial antes de abrir la encuesta.",
+      runtimeState
     });
 
+    runtimeState.currentStep = "opening_survey";
     await page.goto(surveyUrl, {
       waitUntil: "networkidle"
     });
+    await refreshRuntimePageState(runtimeState, page);
     await captureRawInitialScreenshot({
       page,
       runId,
       step: "opening_survey",
       action: "after-open-survey",
-      message: "Encuesta abierta en navegador."
+      message: "Encuesta abierta en navegador.",
+      runtimeState
     });
     await emitWorkerEvent({
       runId,
@@ -1397,9 +1545,11 @@ export async function runPilotSurvey(runId: string) {
       message: "Antes de llenar store code.",
       metadata: {
         storeCode
-      }
+      },
+      runtimeState
     });
 
+    runtimeState.currentStep = "initial_screen";
     const storeCodeMatch = await resolveStoreCodeInput(page, browserConfig.selectors);
 
     if (!storeCodeMatch) {
@@ -1450,6 +1600,7 @@ export async function runPilotSurvey(runId: string) {
     });
 
     try {
+      runtimeState.lastSelector = storeCodeMatch.selector;
       const valueBefore = await readInputValue(storeCodeMatch.locator);
       await emitWorkerEvent({
         runId,
@@ -1504,7 +1655,8 @@ export async function runPilotSurvey(runId: string) {
             "validInputs" in storeCodeMatch && Array.isArray(storeCodeMatch.validInputs)
               ? storeCodeMatch.validInputs
               : []
-        }
+        },
+        runtimeState
       });
       await emitWorkerEvent({
         runId,
@@ -1530,11 +1682,19 @@ export async function runPilotSurvey(runId: string) {
           finalInputChosen: storeCodeMatch.selector
         }
       });
-    } catch {
+    } catch (error) {
       throw new PilotFlowError(
         "No se pudo escribir y confirmar el store code en la pantalla inicial.",
         "needs_selector_calibration",
-        "initial_screen"
+        "initial_screen",
+        {
+          cause: error,
+          details: {
+            selectorUsed: storeCodeMatch.selector,
+            resolutionStrategy: storeCodeMatch.strategy,
+            fallbackUsed: storeCodeMatch.fallbackLabel ?? null
+          }
+        }
       );
     }
 
@@ -1552,7 +1712,8 @@ export async function runPilotSurvey(runId: string) {
       runId,
       step: "initial_screen",
       action: "before-submit-store-code",
-      message: "Antes de enviar el formulario inicial."
+      message: "Antes de enviar el formulario inicial.",
+      runtimeState
     });
 
     const initialUrlBeforeSubmit = page.url();
@@ -1563,6 +1724,7 @@ export async function runPilotSurvey(runId: string) {
       initialUrl: initialUrlBeforeSubmit
     });
     const validatorScreen = validatorTransition.screen;
+    await refreshRuntimePageState(runtimeState, page);
 
     await captureRawInitialScreenshot({
       page,
@@ -1576,8 +1738,11 @@ export async function runPilotSurvey(runId: string) {
         validatorDetected: validatorTransition.validatorDetected,
         validatorSelector: validatorTransition.validatorSelector,
         currentUrl: validatorTransition.currentUrl
-      }
+      },
+      runtimeState
     });
+    runtimeState.currentStep = "validator_screen";
+    runtimeState.lastSelector = validatorTransition.validatorSelector ?? runtimeState.lastSelector;
     await emitWorkerEvent({
       runId,
       eventType: "screen_detected",
@@ -2342,12 +2507,18 @@ export async function runPilotSurvey(runId: string) {
       }
     });
   } catch (error) {
+    await refreshRuntimePageState(runtimeState, page).catch(() => null);
+
     const screenshot = await captureAndUploadScreenshot({
       page,
       runId,
-      fileName: `error-${Date.now()}.png`,
+      fileName: "fatal-error.png",
       bucket: STORAGE_BUCKETS.errorScreenshots
     }).catch(() => null);
+
+    if (screenshot) {
+      runtimeState.lastScreenshotPath = screenshot.storagePath;
+    }
 
     const normalizedError =
       error instanceof PilotFlowError
@@ -2355,12 +2526,33 @@ export async function runPilotSurvey(runId: string) {
         : new PilotFlowError(
             error instanceof Error ? error.message : "Error desconocido en worker.",
             "failed",
-            "failed"
+            runtimeState.currentStep || "failed",
+            {
+              cause: error
+            }
           );
+
+    const serializedError = serializeUnknownError(normalizedError);
+    const htmlPartial = await page.content().then((content) => content.slice(0, 50_000)).catch(() => "");
+    const htmlArtifact = htmlPartial
+      ? await uploadHtmlArtifact({
+          runId,
+          name: `fatal-error-${Date.now()}`,
+          html: htmlPartial
+        }).catch(() => null)
+      : null;
+    const failureContext = {
+      step: normalizedError.step || runtimeState.currentStep,
+      url: runtimeState.currentUrl,
+      title: runtimeState.currentTitle,
+      lastSelector: runtimeState.lastSelector,
+      lastScreenshotPath: runtimeState.lastScreenshotPath,
+      htmlArtifactPath: htmlArtifact?.path ?? null
+    };
 
     await updateSurveyRun(runId, {
       status: normalizedError.runStatus,
-      current_step: normalizedError.step,
+      current_step: failureContext.step,
       last_error: normalizedError.message,
       error_screenshot_bucket: screenshot ? STORAGE_BUCKETS.errorScreenshots : null,
       error_screenshot_path: screenshot?.storagePath ?? null
@@ -2370,14 +2562,35 @@ export async function runPilotSurvey(runId: string) {
       runId,
       level: "error",
       eventType: "run_failed",
-      step: normalizedError.step,
+      step: failureContext.step ?? "failed",
       message: normalizedError.message,
       metadata: {
-        currentStep: normalizedError.step,
-        statusAssigned: normalizedError.runStatus
+        currentStep: failureContext.step,
+        statusAssigned: normalizedError.runStatus,
+        url: failureContext.url,
+        title: failureContext.title,
+        lastSelector: failureContext.lastSelector,
+        lastScreenshotPath: failureContext.lastScreenshotPath,
+        error: serializedError.message,
+        stack: serializedError.stack,
+        errorName: serializedError.name,
+        cause: serializedError.cause,
+        playwright: serializedError.playwright,
+        htmlArtifactPath: failureContext.htmlArtifactPath,
+        errorDetails: normalizedError.details ?? null
       },
       screenshotBucket: screenshot ? STORAGE_BUCKETS.errorScreenshots : undefined,
       screenshotPath: screenshot?.storagePath
+    });
+
+    Object.assign(normalizedError, {
+      debugContext: {
+        ...failureContext,
+        stack: serializedError.stack,
+        name: serializedError.name,
+        cause: serializedError.cause,
+        playwright: serializedError.playwright
+      }
     });
 
     throw normalizedError;
