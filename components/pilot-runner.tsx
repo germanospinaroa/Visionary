@@ -9,6 +9,10 @@ type EventDetails = {
   evidenceImageId?: string;
   selectorUsed?: string;
   fallbackUsed?: string;
+  fillMethod?: string;
+  clickStrategy?: string;
+  valueBefore?: string;
+  valueAfter?: string;
   attemptedSelectors?: string[];
   failedSelectors?: string[];
   detectedInputs?: Array<{
@@ -794,6 +798,12 @@ export function PilotRunner() {
                     {typeof event.details?.fallbackUsed === "string" ? (
                       <span className="timeline-step">Fallback: {event.details.fallbackUsed}</span>
                     ) : null}
+                    {typeof event.details?.fillMethod === "string" ? (
+                      <span className="timeline-step">Método: {event.details.fillMethod}</span>
+                    ) : null}
+                    {typeof event.details?.clickStrategy === "string" ? (
+                      <span className="timeline-step">Click: {event.details.clickStrategy}</span>
+                    ) : null}
                   </article>
                 ))}
               </div>
@@ -821,6 +831,15 @@ export function PilotRunner() {
                 ) : null}
                 {typeof event.details?.fallbackUsed === "string" ? (
                   <span className="timeline-step">Fallback: {event.details.fallbackUsed}</span>
+                ) : null}
+                {typeof event.details?.fillMethod === "string" ? (
+                  <span className="timeline-step">Método: {event.details.fillMethod}</span>
+                ) : null}
+                {typeof event.details?.clickStrategy === "string" ? (
+                  <span className="timeline-step">Click: {event.details.clickStrategy}</span>
+                ) : null}
+                {typeof event.details?.valueAfter === "string" ? (
+                  <span className="timeline-step">Valor confirmado: {event.details.valueAfter}</span>
                 ) : null}
               </article>
             ))

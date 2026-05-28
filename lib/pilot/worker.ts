@@ -40,6 +40,16 @@ type SelectorResolution = VisibleMatch & {
   failedSelectors: string[];
 };
 
+type FillAttemptResult = {
+  method: "fill" | "keyboard.type" | "js_injection";
+  valueBefore: string;
+  valueAfter: string;
+};
+
+type ClickAttemptResult = {
+  strategy: "locator.click" | "element.click" | "keyboard.enter";
+};
+
 type ScreenInputDiagnostic = {
   tag: string;
   type: string;
@@ -561,8 +571,120 @@ async function assertFieldValue({
   }
 }
 
-async function classifyScreen(page: Page, selectors: SurveySelectorConfig): Promise<ScreenState> {
-  const { urls, matchedImageSelectors } = await extractImageLinks(page, selectors);
+async function countDetectedInputs(page: Page) {
+  return page.locator("input, textarea, select").count();
+}
+
+async function readInputValue(locator: Locator) {
+  return locator
+    .evaluate((element) => {
+      if (
+        element instanceof HTMLInputElement ||
+        element instanceof HTMLTextAreaElement ||
+        element instanceof HTMLSelectElement
+      ) {
+        return element.value ?? "";
+      }
+
+      return element.getAttribute("value") ?? "";
+    })
+    .catch(async () => (await locator.getAttribute("value")) ?? "");
+}
+
+async function tryFillStoreCode(locator: Locator, page: Page, value: string): Promise<FillAttemptResult> {
+  const valueBefore = await readInputValue(locator);
+
+  try {
+    await locator.fill(value);
+    const valueAfter = await readInputValue(locator);
+    if (valueAfter.trim() === value.trim()) {
+      return {
+        method: "fill",
+        valueBefore,
+        valueAfter
+      };
+    }
+  } catch {
+    // Continue to next strategy.
+  }
+
+  try {
+    await locator.click();
+    await locator.focus();
+    await page.keyboard.press(process.platform === "darwin" ? "Meta+A" : "Control+A").catch(() => null);
+    await page.keyboard.type(value);
+    const valueAfter = await readInputValue(locator);
+    if (valueAfter.trim() === value.trim()) {
+      return {
+        method: "keyboard.type",
+        valueBefore,
+        valueAfter
+      };
+    }
+  } catch {
+    // Continue to next strategy.
+  }
+
+  await locator.evaluate(
+    (element, nextValue) => {
+      const target = element as HTMLInputElement | HTMLTextAreaElement | HTMLSelectElement;
+      target.focus();
+      target.value = nextValue;
+      target.dispatchEvent(new Event("input", { bubbles: true }));
+      target.dispatchEvent(new Event("change", { bubbles: true }));
+    },
+    value
+  );
+
+  const valueAfter = await readInputValue(locator);
+  if (valueAfter.trim() === value.trim()) {
+    return {
+      method: "js_injection",
+      valueBefore,
+      valueAfter
+    };
+  }
+
+  throw new Error("No se pudo escribir el valor con ninguna estrategia de fill.");
+}
+
+async function tryClickEntryButton(
+  buttonLocator: Locator,
+  inputLocator: Locator,
+  page: Page
+): Promise<ClickAttemptResult> {
+  try {
+    await buttonLocator.click();
+    return { strategy: "locator.click" };
+  } catch {
+    // Continue to next strategy.
+  }
+
+  try {
+    await buttonLocator.evaluate((element) => {
+      (element as HTMLButtonElement | HTMLInputElement).click();
+    });
+    return { strategy: "element.click" };
+  } catch {
+    // Continue to next strategy.
+  }
+
+  await inputLocator.focus();
+  await page.keyboard.press("Enter");
+  return { strategy: "keyboard.enter" };
+}
+
+async function classifyScreen(
+  page: Page,
+  selectors: SurveySelectorConfig,
+  options?: {
+    skipImages?: boolean;
+  }
+): Promise<ScreenState> {
+  const skipImages = options?.skipImages ?? false;
+  const { urls, matchedImageSelectors } = skipImages
+    ? { urls: [] as string[], matchedImageSelectors: [] as string[] }
+    : await extractImageLinks(page, selectors);
   const hasStoreInput = Boolean(await firstVisible(page, selectors.storeCodeInputSelectors));
   const hasValidatorInput = Boolean(await firstVisible(page, selectors.validatorCodeInputSelectors));
   const hasEntryButton = Boolean(await firstVisible(page, selectors.entryButtonSelectors));
@@ -629,7 +751,8 @@ async function waitForExpectedScreen({
   expectedKinds,
   timeoutMs,
   failureStep,
-  failureMessage
+  failureMessage,
+  skipImages = false
 }: {
   page: Page;
   selectors: SurveySelectorConfig;
@@ -637,12 +760,13 @@ async function waitForExpectedScreen({
   timeoutMs: number;
   failureStep: string;
   failureMessage: string;
+  skipImages?: boolean;
 }) {
   const startedAt = Date.now();
 
   while (Date.now() - startedAt < timeoutMs) {
     await page.waitForLoadState("networkidle").catch(() => null);
-    const screen = await classifyScreen(page, selectors);
+    const screen = await classifyScreen(page, selectors, { skipImages });
 
     if (expectedKinds.includes(screen.kind)) {
       return screen;
@@ -1081,7 +1205,8 @@ export async function runPilotSurvey(runId: string) {
       expectedKinds: ["initial"],
       timeoutMs: 10_000,
       failureStep: "initial_screen",
-      failureMessage: "No se detectó la pantalla inicial esperada. Se requiere calibración."
+      failureMessage: "No se detectó la pantalla inicial esperada. Se requiere calibración.",
+      skipImages: true
     });
     await emitWorkerEvent({
       runId,
@@ -1097,6 +1222,17 @@ export async function runPilotSurvey(runId: string) {
       run.stores && typeof run.stores === "object" && "store_code" in run.stores
         ? String(run.stores.store_code ?? "")
         : "";
+
+    await emitWorkerEvent({
+      runId,
+      eventType: "store_code_search_started",
+      step: "initial_screen",
+      message: "Buscando input store_code.",
+      metadata: {
+        configuredSelectors: browserConfig.selectors.storeCodeInputSelectors,
+        detectedInputCount: await countDetectedInputs(page)
+      }
+    });
 
     await emitWorkerEvent({
       runId,
@@ -1172,12 +1308,68 @@ export async function runPilotSurvey(runId: string) {
     });
 
     try {
-      await storeCodeMatch.locator.fill(storeCode);
+      const valueBefore = await readInputValue(storeCodeMatch.locator);
+      await emitWorkerEvent({
+        runId,
+        eventType: "store_code_fill_attempt",
+        step: "initial_screen",
+        message: "Intentando fill de store code.",
+        metadata: {
+          selectorUsed: storeCodeMatch.selector,
+          valueBefore
+        }
+      });
+      const fillResult = await tryFillStoreCode(storeCodeMatch.locator, page, storeCode);
+      const confirmedValue = await storeCodeMatch.locator.evaluate((element) => {
+        if (
+          element instanceof HTMLInputElement ||
+          element instanceof HTMLTextAreaElement ||
+          element instanceof HTMLSelectElement
+        ) {
+          return element.value ?? "";
+        }
+
+        return element.getAttribute("value") ?? "";
+      });
+      if (confirmedValue.trim() !== storeCode.trim()) {
+        throw new Error("El valor escrito no quedó confirmado en el input.");
+      }
       await assertFieldValue({
         locator: storeCodeMatch.locator,
         expectedValue: storeCode,
         fieldName: "store code",
         step: "initial_screen"
+      });
+
+      await captureActionScreenshot({
+        page,
+        runId,
+        step: "initial_screen",
+        action: "after-fill-store-code",
+        message: "Store code visible en el formulario.",
+        metadata: {
+          storeCode,
+          selectorUsed: storeCodeMatch.selector,
+          fallbackUsed: storeCodeMatch.fallbackLabel ?? null,
+          fillMethod: fillResult.method,
+          valueBefore: fillResult.valueBefore,
+          valueAfter: fillResult.valueAfter
+        }
+      });
+      await emitWorkerEvent({
+        runId,
+        eventType: "store_code_filled",
+        step: "initial_screen",
+        message: "Valor escrito confirmado.",
+        metadata: {
+          storeCode,
+          selectorUsed: storeCodeMatch.selector,
+          resolutionStrategy: storeCodeMatch.strategy,
+          fallbackUsed: storeCodeMatch.fallbackLabel ?? null,
+          fillMethod: fillResult.method,
+          valueBefore: fillResult.valueBefore,
+          valueAfter: fillResult.valueAfter
+        }
       });
     } catch {
       await recordScreenDiagnostics({
@@ -1200,31 +1392,6 @@ export async function runPilotSurvey(runId: string) {
         "initial_screen"
       );
     }
-
-    await captureActionScreenshot({
-      page,
-      runId,
-      step: "initial_screen",
-      action: "after-fill-store-code",
-      message: "Store code visible en el formulario.",
-      metadata: {
-        storeCode,
-        selectorUsed: storeCodeMatch.selector,
-        fallbackUsed: storeCodeMatch.fallbackLabel ?? null
-      }
-    });
-    await emitWorkerEvent({
-      runId,
-      eventType: "store_code_filled",
-      step: "initial_screen",
-      message: "Campo store code llenado.",
-      metadata: {
-        storeCode,
-        selectorUsed: storeCodeMatch.selector,
-        resolutionStrategy: storeCodeMatch.strategy,
-        fallbackUsed: storeCodeMatch.fallbackLabel ?? null
-      }
-    });
 
     await emitWorkerEvent({
       runId,
@@ -1297,7 +1464,40 @@ export async function runPilotSurvey(runId: string) {
     });
 
     try {
-      await entryButtonMatch.locator.click();
+      await emitWorkerEvent({
+        runId,
+        eventType: "entry_click_attempt",
+        step: "initial_screen",
+        message: "Intentando click Entrar.",
+        metadata: {
+          selectorUsed: entryButtonMatch.selector
+        }
+      });
+      const clickResult = await tryClickEntryButton(entryButtonMatch.locator, storeCodeMatch.locator, page);
+      await captureActionScreenshot({
+        page,
+        runId,
+        step: "initial_screen",
+        action: "after-click-entry",
+        message: "Click Entrar ejecutado.",
+        metadata: {
+          selectorUsed: entryButtonMatch.selector,
+          clickStrategy: clickResult.strategy
+        }
+      });
+      await emitWorkerEvent({
+        runId,
+        eventType: "next_clicked",
+        step: "initial_screen",
+        message: "Clic en Entrar.",
+        metadata: {
+          context: "entry_screen",
+          selectorUsed: entryButtonMatch.selector,
+          resolutionStrategy: entryButtonMatch.strategy,
+          fallbackUsed: entryButtonMatch.fallbackLabel ?? null,
+          clickStrategy: clickResult.strategy
+        }
+      });
     } catch {
       await recordScreenDiagnostics({
         page,
@@ -1330,7 +1530,8 @@ export async function runPilotSurvey(runId: string) {
         timeoutMs: 12_000,
         failureStep: "validator_screen",
         failureMessage:
-          "No se detectó la segunda pantalla después de Entrar. Se requiere calibración."
+          "No se detectó la segunda pantalla después de Entrar. Se requiere calibración.",
+        skipImages: true
       });
     } catch {
       await recordScreenDiagnostics({
@@ -1356,22 +1557,10 @@ export async function runPilotSurvey(runId: string) {
       page,
       runId,
       step: "validator_screen",
-      action: "after-click-entry",
+      action: "validator-screen-detected",
       message: "Segunda pantalla detectada.",
       metadata: {
         detectedScreen: validatorScreen.kind
-      }
-    });
-    await emitWorkerEvent({
-      runId,
-      eventType: "next_clicked",
-      step: "initial_screen",
-      message: "Clic en Entrar.",
-      metadata: {
-        context: "entry_screen",
-        selectorUsed: entryButtonMatch.selector,
-        resolutionStrategy: entryButtonMatch.strategy,
-        fallbackUsed: entryButtonMatch.fallbackLabel ?? null
       }
     });
     await emitWorkerEvent({
@@ -1380,25 +1569,28 @@ export async function runPilotSurvey(runId: string) {
       step: "validator_screen",
       message: "Segunda pantalla detectada.",
       metadata: {
-        screen: validatorScreen.kind
+        screen: validatorScreen.kind,
+        navigationDetected: true
       }
     });
 
     await updateSurveyRun(runId, {
-      status: "extracting_images",
+      status: "paused",
       current_step: "validator_screen",
       current_question_text: null
     });
 
     await emitWorkerEvent({
       runId,
-      eventType: "filling_validator_code",
+      eventType: "initial_phase_completed",
       step: "validator_screen",
-      message: "Completando validator code.",
+      message: "Fase inicial validada. Flujo detenido intencionalmente en segunda pantalla.",
       metadata: {
-        validatorCodeLength: validatorCode.length
+        objective: "store_code_written_and_second_screen_detected"
       }
     });
+
+    return;
     await captureActionScreenshot({
       page,
       runId,
@@ -1490,13 +1682,20 @@ export async function runPilotSurvey(runId: string) {
             storagePath: extracted.storagePath
           }
         });
-      } catch (imageError) {
+      } catch (imageError: unknown) {
+        let imageErrorMessage = "Error descargando imagen.";
+        if (imageError && typeof imageError === "object") {
+          const imageErrorCandidate = imageError as { message?: unknown };
+          if (typeof imageErrorCandidate.message === "string") {
+            imageErrorMessage = String(imageErrorCandidate.message);
+          }
+        }
         await emitWorkerEvent({
           runId,
           level: "warn",
           eventType: "image_extract_failed",
           step: "validator_screen",
-          message: imageError instanceof Error ? imageError.message : "Error descargando imagen.",
+          message: imageErrorMessage,
           metadata: {
             sourceUrl
           }
