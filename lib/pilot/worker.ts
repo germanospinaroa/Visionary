@@ -41,13 +41,9 @@ type SelectorResolution = VisibleMatch & {
 };
 
 type FillAttemptResult = {
-  method: "fill" | "keyboard.type" | "js_injection";
+  method: "fill";
   valueBefore: string;
   valueAfter: string;
-};
-
-type ClickAttemptResult = {
-  strategy: "locator.click" | "element.click" | "keyboard.enter";
 };
 
 type ScreenInputDiagnostic = {
@@ -159,64 +155,6 @@ async function firstVisible(page: Page, selectors: string[]): Promise<VisibleMat
         continue;
       }
     }
-  }
-
-  return null;
-}
-
-async function resolveTarget(
-  page: Page,
-  configuredSelectors: string[],
-  fallbackCandidates: Array<{ selector: string; label: string }>
-): Promise<SelectorResolution | null> {
-  const attemptedSelectors: string[] = [];
-  const failedSelectors: string[] = [];
-
-  for (const selector of configuredSelectors) {
-    attemptedSelectors.push(selector);
-    const locator = page.locator(selector).first();
-
-    try {
-      if (await locator.count()) {
-        if (await locator.isVisible()) {
-          return {
-            locator,
-            selector,
-            strategy: "configured",
-            attemptedSelectors,
-            failedSelectors
-          };
-        }
-      }
-    } catch {
-      // Continue to next selector.
-    }
-
-    failedSelectors.push(selector);
-  }
-
-  for (const candidate of fallbackCandidates) {
-    attemptedSelectors.push(candidate.selector);
-    const locator = page.locator(candidate.selector).first();
-
-    try {
-      if (await locator.count()) {
-        if (await locator.isVisible()) {
-          return {
-            locator,
-            selector: candidate.selector,
-            strategy: "fallback",
-            fallbackLabel: candidate.label,
-            attemptedSelectors,
-            failedSelectors
-          };
-        }
-      }
-    } catch {
-      // Continue to next selector.
-    }
-
-    failedSelectors.push(candidate.selector);
   }
 
   return null;
@@ -417,16 +355,6 @@ function getStoreInputKeywords() {
   return ["codigo", "código", "store", "tienda"];
 }
 
-function getEntryButtonFallbacks() {
-  return [
-    { selector: 'button:has-text("Entrar")', label: "entrar_text_button" },
-    { selector: 'button:has-text("Ingresar")', label: "ingresar_text_button" },
-    { selector: 'button:visible', label: "first_visible_button" },
-    { selector: 'input[type="button"]:visible', label: "button_input" },
-    { selector: 'input[type="submit"]:visible', label: "submit_input" }
-  ];
-}
-
 async function collectInputCandidates(page: Page): Promise<{
   totalInputs: number;
   validCandidates: InputCandidate[];
@@ -544,10 +472,6 @@ async function resolveStoreCodeInput(page: Page, _selectors: SurveySelectorConfi
     totalInputs: number;
     validInputs: Array<Record<string, unknown>>;
   };
-}
-
-async function resolveEntryButton(page: Page, selectors: SurveySelectorConfig) {
-  return resolveTarget(page, selectors.entryButtonSelectors, getEntryButtonFallbacks());
 }
 
 async function pageLooksLikeUsedImages(page: Page) {
@@ -731,87 +655,80 @@ async function readInputValue(locator: Locator) {
     .catch(async () => (await locator.getAttribute("value")) ?? "");
 }
 
-async function tryFillStoreCode(locator: Locator, page: Page, value: string): Promise<FillAttemptResult> {
+async function tryFillStoreCode(locator: Locator, value: string): Promise<FillAttemptResult> {
   const valueBefore = await readInputValue(locator);
-
-  try {
-    await locator.fill(value);
-    const valueAfter = await readInputValue(locator);
-    if (valueAfter.trim() === value.trim()) {
-      return {
-        method: "fill",
-        valueBefore,
-        valueAfter
-      };
-    }
-  } catch {
-    // Continue to next strategy.
-  }
-
-  try {
-    await locator.click();
-    await locator.focus();
-    await page.keyboard.press(process.platform === "darwin" ? "Meta+A" : "Control+A").catch(() => null);
-    await page.keyboard.type(value);
-    const valueAfter = await readInputValue(locator);
-    if (valueAfter.trim() === value.trim()) {
-      return {
-        method: "keyboard.type",
-        valueBefore,
-        valueAfter
-      };
-    }
-  } catch {
-    // Continue to next strategy.
-  }
-
-  await locator.evaluate(
-    (element, nextValue) => {
-      const target = element as HTMLInputElement | HTMLTextAreaElement | HTMLSelectElement;
-      target.focus();
-      target.value = nextValue;
-      target.dispatchEvent(new Event("input", { bubbles: true }));
-      target.dispatchEvent(new Event("change", { bubbles: true }));
-    },
-    value
-  );
+  await locator.click();
+  await locator.fill(value);
 
   const valueAfter = await readInputValue(locator);
   if (valueAfter.trim() === value.trim()) {
     return {
-      method: "js_injection",
+      method: "fill",
       valueBefore,
       valueAfter
     };
   }
 
-  throw new Error("No se pudo escribir el valor con ninguna estrategia de fill.");
+  throw new Error("No se pudo escribir el valor usando fill.");
 }
 
-async function tryClickEntryButton(
-  buttonLocator: Locator,
-  inputLocator: Locator,
-  page: Page
-): Promise<ClickAttemptResult> {
-  try {
-    await buttonLocator.click();
-    return { strategy: "locator.click" };
-  } catch {
-    // Continue to next strategy.
-  }
-
-  try {
-    await buttonLocator.evaluate((element) => {
-      (element as HTMLButtonElement | HTMLInputElement).click();
-    });
-    return { strategy: "element.click" };
-  } catch {
-    // Continue to next strategy.
-  }
-
+async function submitStoreCodeAndWaitForValidator({
+  page,
+  inputLocator,
+  selectors,
+  initialUrl
+}: {
+  page: Page;
+  inputLocator: Locator;
+  selectors: SurveySelectorConfig;
+  initialUrl: string;
+}) {
   await inputLocator.focus();
-  await page.keyboard.press("Enter");
-  return { strategy: "keyboard.enter" };
+  await inputLocator.press("Enter");
+
+  const startedAt = Date.now();
+
+  while (Date.now() - startedAt < 12_000) {
+    await page.waitForLoadState("networkidle").catch(() => null);
+
+    const currentUrl = page.url();
+    const urlChanged = currentUrl !== initialUrl;
+    const validatorInput = await firstVisible(page, selectors.validatorCodeInputSelectors);
+
+    if (validatorInput) {
+      return {
+        screen: {
+          kind: "validator",
+          imageLinks: [],
+          matchedImageSelectors: []
+        } as ScreenState,
+        urlChanged,
+        validatorDetected: true,
+        validatorSelector: validatorInput.selector,
+        currentUrl
+      };
+    }
+
+    if (urlChanged) {
+      const classifiedScreen = await classifyScreen(page, selectors, { skipImages: true });
+
+      return {
+        screen: classifiedScreen,
+        urlChanged: true,
+        validatorDetected: classifiedScreen.kind === "validator",
+        validatorSelector: null,
+        currentUrl
+      };
+    }
+
+    await page.waitForTimeout(500);
+  }
+
+  throw new PilotFlowError(
+    "No se detectó la segunda pantalla después de enviar el store code.",
+    "needs_selector_calibration",
+    "validator_screen"
+  );
 }
 
 async function classifyScreen(
@@ -1486,16 +1403,6 @@ export async function runPilotSurvey(runId: string) {
     const storeCodeMatch = await resolveStoreCodeInput(page, browserConfig.selectors);
 
     if (!storeCodeMatch) {
-      await recordScreenDiagnostics({
-        page,
-        runId,
-        step: "initial_screen",
-        name: "initial-screen-store-input-missing",
-        message: "No se encontró un campo válido para store code.",
-        metadata: {
-          attemptedSelectors: browserConfig.selectors.storeCodeInputSelectors
-        }
-      });
       throw new PilotFlowError(
         "No se encontró un campo válido para store code en la pantalla inicial.",
         "needs_selector_calibration",
@@ -1554,7 +1461,7 @@ export async function runPilotSurvey(runId: string) {
           valueBefore
         }
       });
-      const fillResult = await tryFillStoreCode(storeCodeMatch.locator, page, storeCode);
+      const fillResult = await tryFillStoreCode(storeCodeMatch.locator, storeCode);
       const confirmedValue = await storeCodeMatch.locator.evaluate((element) => {
         if (
           element instanceof HTMLInputElement ||
@@ -1624,20 +1531,6 @@ export async function runPilotSurvey(runId: string) {
         }
       });
     } catch {
-      await recordScreenDiagnostics({
-        page,
-        runId,
-        step: "initial_screen",
-        name: "initial-screen-store-fill-failed",
-        message: "Fallo al escribir o confirmar store code.",
-        metadata: {
-          selectorUsed: storeCodeMatch.selector,
-          resolutionStrategy: storeCodeMatch.strategy,
-          fallbackUsed: storeCodeMatch.fallbackLabel ?? null,
-          attemptedSelectors: storeCodeMatch.attemptedSelectors,
-          failedSelectors: storeCodeMatch.failedSelectors
-        }
-      });
       throw new PilotFlowError(
         "No se pudo escribir y confirmar el store code en la pantalla inicial.",
         "needs_selector_calibration",
@@ -1647,172 +1540,42 @@ export async function runPilotSurvey(runId: string) {
 
     await emitWorkerEvent({
       runId,
-      eventType: "clicking_next",
+      eventType: "submitting_store_code",
       step: "initial_screen",
-      message: "Preparando clic en Entrar.",
+      message: "Enviando formulario inicial con Enter.",
       metadata: {
-        context: "entry_screen"
+        strategy: "fill_plus_enter"
       }
     });
     await captureRawInitialScreenshot({
       page,
       runId,
       step: "initial_screen",
-      action: "before-click-entry",
-      message: "Antes de hacer clic en Entrar."
+      action: "before-submit-store-code",
+      message: "Antes de enviar el formulario inicial."
     });
 
-    const entryButtonMatch = await resolveEntryButton(page, browserConfig.selectors);
-
-    if (!entryButtonMatch) {
-      await recordScreenDiagnostics({
-        page,
-        runId,
-        step: "initial_screen",
-        name: "initial-screen-entry-button-missing",
-        message: "No se encontró el botón Entrar en la pantalla inicial.",
-        metadata: {
-          attemptedSelectors: [
-            ...browserConfig.selectors.entryButtonSelectors,
-            ...getEntryButtonFallbacks().map((fallback) => fallback.selector)
-          ]
-        }
-      });
-      throw new PilotFlowError(
-        "No se encontró el botón Entrar en la pantalla inicial.",
-        "needs_selector_calibration",
-        "initial_screen"
-      );
-    }
-
-    if (entryButtonMatch.strategy === "fallback") {
-      await emitWorkerEvent({
-        runId,
-        level: "warn",
-        eventType: "selector_fallback_used",
-        step: "initial_screen",
-        message: "Selector configurado para botón Entrar no respondió; se aplicó fallback.",
-        metadata: {
-          attemptedSelectors: entryButtonMatch.attemptedSelectors,
-          failedSelectors: entryButtonMatch.failedSelectors,
-          selectorUsed: entryButtonMatch.selector,
-          fallbackUsed: entryButtonMatch.fallbackLabel
-        }
-      });
-    }
-
-    await emitWorkerEvent({
-      runId,
-      eventType: "selector_resolved",
-      step: "initial_screen",
-      message: "Botón Entrar seleccionado.",
-      metadata: {
-        selectorUsed: entryButtonMatch.selector,
-        resolutionStrategy: entryButtonMatch.strategy,
-        fallbackUsed: entryButtonMatch.fallbackLabel ?? null,
-        attemptedSelectors: entryButtonMatch.attemptedSelectors,
-        failedSelectors: entryButtonMatch.failedSelectors
-      }
+    const initialUrlBeforeSubmit = page.url();
+    const validatorTransition = await submitStoreCodeAndWaitForValidator({
+      page,
+      inputLocator: storeCodeMatch.locator,
+      selectors: browserConfig.selectors,
+      initialUrl: initialUrlBeforeSubmit
     });
-
-    try {
-      await emitWorkerEvent({
-        runId,
-        eventType: "entry_click_attempt",
-        step: "initial_screen",
-        message: "Intentando click Entrar.",
-        metadata: {
-          selectorUsed: entryButtonMatch.selector
-        }
-      });
-      const clickResult = await tryClickEntryButton(entryButtonMatch.locator, storeCodeMatch.locator, page);
-      await captureRawInitialScreenshot({
-        page,
-        runId,
-        step: "initial_screen",
-        action: "after-click-entry",
-        message: "Click Entrar ejecutado.",
-        metadata: {
-          selectorUsed: entryButtonMatch.selector,
-          clickStrategy: clickResult.strategy
-        }
-      });
-      await emitWorkerEvent({
-        runId,
-        eventType: "next_clicked",
-        step: "initial_screen",
-        message: "Clic en Entrar.",
-        metadata: {
-          context: "entry_screen",
-          selectorUsed: entryButtonMatch.selector,
-          resolutionStrategy: entryButtonMatch.strategy,
-          fallbackUsed: entryButtonMatch.fallbackLabel ?? null,
-          clickStrategy: clickResult.strategy
-        }
-      });
-    } catch {
-      await recordScreenDiagnostics({
-        page,
-        runId,
-        step: "initial_screen",
-        name: "initial-screen-entry-click-failed",
-        message: "Fallo al hacer clic en Entrar.",
-        metadata: {
-          selectorUsed: entryButtonMatch.selector,
-          resolutionStrategy: entryButtonMatch.strategy,
-          fallbackUsed: entryButtonMatch.fallbackLabel ?? null,
-          attemptedSelectors: entryButtonMatch.attemptedSelectors,
-          failedSelectors: entryButtonMatch.failedSelectors
-        }
-      });
-      throw new PilotFlowError(
-        "No se pudo hacer clic en Entrar en la pantalla inicial.",
-        "needs_selector_calibration",
-        "initial_screen"
-      );
-    }
-
-    let validatorScreen: ScreenState;
-
-    try {
-      validatorScreen = await waitForExpectedScreen({
-        page,
-        selectors: browserConfig.selectors,
-        expectedKinds: ["validator"],
-        timeoutMs: 12_000,
-        failureStep: "validator_screen",
-        failureMessage:
-          "No se detectó la segunda pantalla después de Entrar. Se requiere calibración.",
-        skipImages: true
-      });
-    } catch {
-      await recordScreenDiagnostics({
-        page,
-        runId,
-        step: "validator_screen",
-        name: "validator-screen-not-detected",
-        message: "No se detectó cambio de pantalla después de hacer clic en Entrar.",
-        metadata: {
-          selectorUsed: entryButtonMatch.selector,
-          resolutionStrategy: entryButtonMatch.strategy,
-          fallbackUsed: entryButtonMatch.fallbackLabel ?? null
-        }
-      });
-      throw new PilotFlowError(
-        "No se detectó la segunda pantalla después de Entrar.",
-        "needs_selector_calibration",
-        "validator_screen"
-      );
-    }
+    const validatorScreen = validatorTransition.screen;
 
     await captureRawInitialScreenshot({
       page,
       runId,
       step: "validator_screen",
-      action: "validator-screen-detected",
+      action: "after-submit-store-code",
       message: "Segunda pantalla detectada.",
       metadata: {
-        detectedScreen: validatorScreen.kind
+        detectedScreen: validatorScreen.kind,
+        urlChanged: validatorTransition.urlChanged,
+        validatorDetected: validatorTransition.validatorDetected,
+        validatorSelector: validatorTransition.validatorSelector,
+        currentUrl: validatorTransition.currentUrl
       }
     });
     await emitWorkerEvent({
@@ -1822,7 +1585,10 @@ export async function runPilotSurvey(runId: string) {
       message: "Segunda pantalla detectada.",
       metadata: {
         screen: validatorScreen.kind,
-        navigationDetected: true
+        navigationDetected: validatorTransition.urlChanged,
+        validatorDetected: validatorTransition.validatorDetected,
+        validatorSelector: validatorTransition.validatorSelector,
+        currentUrl: validatorTransition.currentUrl
       }
     });
 
