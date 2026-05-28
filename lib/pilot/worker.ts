@@ -170,6 +170,14 @@ function buildHtmlArtifactPath(runId: string, name: string) {
   return path.posix.join("runs", runId, "artifacts", `${name}.html`);
 }
 
+function shouldDisableHtmlArtifactUpload(step?: string) {
+  if (!step) {
+    return false;
+  }
+
+  return step === "opening_survey" || step === "diagnostics";
+}
+
 function buildWorkerTraceContext(
   runId: string,
   currentStep: string,
@@ -444,6 +452,7 @@ async function uploadHtmlArtifact({
   step?: string;
 }) {
   const filePath = buildHtmlArtifactPath(runId, name);
+  const shouldSkipUpload = shouldDisableHtmlArtifactUpload(step);
   const traceContext = buildWorkerTraceContext(runId, step ?? "unknown", {
     contentType: "text/html; charset=utf-8",
     artifactType: "html_artifact",
@@ -459,6 +468,25 @@ async function uploadHtmlArtifact({
     contentType: "text/html; charset=utf-8",
     fileName: filePath
   });
+
+  if (shouldSkipUpload) {
+    console.warn(
+      JSON.stringify({
+        scope: "lib/pilot/worker",
+        event: "uploadHtmlArtifact:skipped",
+        callerFunction: "uploadHtmlArtifact",
+        artifactType: "html_artifact",
+        mime: "text/html; charset=utf-8",
+        filename: filePath,
+        currentStep: step ?? "unknown",
+        runId,
+        reason: "html_artifact_upload_temporarily_disabled_for_step",
+        timestamp: new Date().toISOString()
+      })
+    );
+
+    return null;
+  }
 
   await uploadBufferToStorage({
     bucket: STORAGE_BUCKETS.analysisArtifacts,
@@ -519,7 +547,7 @@ async function recordScreenDiagnostics({
     metadata: {
       ...metadata,
       diagnosticsArtifactPath: jsonArtifact.path,
-      htmlArtifactPath: htmlArtifact.path,
+      htmlArtifactPath: htmlArtifact?.path ?? null,
       detectedInputCount: diagnostics.inputs.length,
       detectedButtonCount: diagnostics.buttons.length,
       detectedInputs: diagnostics.inputs,
@@ -2674,7 +2702,9 @@ export async function runPilotSurvey(runId: string) {
 
     const serializedError = serializeUnknownError(normalizedError);
     const htmlPartial = await page.content().then((content) => content.slice(0, 50_000)).catch(() => "");
-    const shouldSkipHtmlArtifactUpload = (runtimeState.currentStep || normalizedError.step) === "opening_survey";
+    const shouldSkipHtmlArtifactUpload = shouldDisableHtmlArtifactUpload(
+      runtimeState.currentStep || normalizedError.step
+    );
 
     if (htmlPartial && shouldSkipHtmlArtifactUpload) {
       console.warn(
@@ -2827,7 +2857,7 @@ export async function diagnosePilotRunScreen(runId: string) {
       screenshotPath: diagnostic.screenshot.storagePath,
       screenshotBucket: STORAGE_BUCKETS.analysisArtifacts,
       diagnosticsArtifactPath: diagnostic.jsonArtifact.path,
-      htmlArtifactPath: diagnostic.htmlArtifact.path,
+      htmlArtifactPath: diagnostic.htmlArtifact?.path ?? null,
       inputs: diagnostic.diagnostics.inputs,
       buttons: diagnostic.diagnostics.buttons
     };
