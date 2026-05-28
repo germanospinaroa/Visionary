@@ -61,3 +61,10 @@ export async function getRemotePilotRunStatus(runId: string) {
     method: "GET"
   });
 }
+
+export async function diagnoseRemotePilotRun(runId: string) {
+  return callWorkerApi(`/runs/${runId}/diagnose`, {
+    method: "POST",
+    body: JSON.stringify({ runId })
+  });
+}

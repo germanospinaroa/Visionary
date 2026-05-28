@@ -357,7 +357,9 @@ async function recordScreenDiagnostics({
       diagnosticsArtifactPath: jsonArtifact.path,
       htmlArtifactPath: htmlArtifact.path,
       detectedInputCount: diagnostics.inputs.length,
-      detectedButtonCount: diagnostics.buttons.length
+      detectedButtonCount: diagnostics.buttons.length,
+      detectedInputs: diagnostics.inputs,
+      detectedButtons: diagnostics.buttons
     },
     screenshotBucket: STORAGE_BUCKETS.analysisArtifacts,
     screenshotPath: screenshot.storagePath
@@ -2212,7 +2214,7 @@ export async function diagnosePilotRunScreen(runId: string) {
       waitUntil: "networkidle"
     });
     const screen = await classifyScreen(page, browserConfig.selectors);
-    await recordScreenDiagnostics({
+    const diagnostic = await recordScreenDiagnostics({
       page,
       runId,
       step: "diagnostics",
@@ -2232,6 +2234,16 @@ export async function diagnosePilotRunScreen(runId: string) {
         detectedScreen: screen.kind
       }
     });
+
+    return {
+      detectedScreen: screen.kind,
+      screenshotPath: diagnostic.screenshot.storagePath,
+      screenshotBucket: STORAGE_BUCKETS.analysisArtifacts,
+      diagnosticsArtifactPath: diagnostic.jsonArtifact.path,
+      htmlArtifactPath: diagnostic.htmlArtifact.path,
+      inputs: diagnostic.diagnostics.inputs,
+      buttons: diagnostic.diagnostics.buttons
+    };
   } finally {
     await browser.close();
   }

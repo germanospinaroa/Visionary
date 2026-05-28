@@ -4,7 +4,7 @@ import { loadEnvConfig } from "@next/env";
 import { createSupabaseAdminClient } from "@/lib/supabase/admin";
 import { getOpenAIClient } from "@/lib/openai";
 import { createBrowserEvent, getSurveyRunDetails, updateSurveyRun } from "@/lib/pilot/db";
-import { runPilotSurvey } from "@/lib/pilot/worker";
+import { diagnosePilotRunScreen, runPilotSurvey } from "@/lib/pilot/worker";
 
 const port = Number(process.env.PILOT_WORKER_API_PORT ?? process.env.PORT ?? 4001);
 const maxConcurrentRuns = Number(process.env.PILOT_MAX_CONCURRENT_RUNS ?? 2);
@@ -262,6 +262,18 @@ async function handleStatusRun(runId: string, response: ServerResponse) {
   });
 }
 
+async function handleDiagnoseRun(runId: string, response: ServerResponse) {
+  const diagnostic = await withTimeout(diagnosePilotRunScreen(runId), 30_000, `Pilot diagnose ${runId}`);
+
+  log("info", "Pilot screen diagnosed.", { runId });
+
+  writeJson(response, 200, {
+    ok: true,
+    runId,
+    diagnostic
+  });
+}
+
 const server = createServer(async (request, response) => {
   const method = request.method ?? "GET";
   const url = new URL(request.url ?? "/", `http://${request.headers.host ?? `127.0.0.1:${port}`}`);
@@ -302,6 +314,12 @@ const server = createServer(async (request, response) => {
       return;
     }
 
+    const diagnoseMatch = url.pathname.match(/^\/runs\/([^/]+)\/diagnose$/);
+    if (method === "POST" && diagnoseMatch) {
+      await handleDiagnoseRun(diagnoseMatch[1], response);
+      return;
+    }
+
     const stopMatch = url.pathname.match(/^\/runs\/([^/]+)\/stop$/);
     if (method === "POST" && stopMatch) {
       await handleStopRun(stopMatch[1], response);
@@ -320,7 +338,9 @@ const server = createServer(async (request, response) => {
     });
 
     writeJson(response, 500, {
-      message
+      ok: false,
+      error: "worker_service_error",
+      detail: message
     });
   }
 });

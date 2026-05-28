@@ -220,6 +220,24 @@ textarea {
   gap: 8px;
 }
 
+.diagnostic-list {
+  display: grid;
+  gap: 8px;
+  max-height: 260px;
+  overflow: auto;
+  padding: 10px;
+  border-radius: 14px;
+  border: 1px solid var(--line);
+  background: rgba(255, 252, 247, 0.7);
+}
+
+.diagnostic-item {
+  font-size: 0.9rem;
+  line-height: 1.45;
+  color: var(--muted);
+  word-break: break-word;
+}
+
 .run-list,
 .qa-list,
 .log-list {

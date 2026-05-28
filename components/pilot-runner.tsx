@@ -7,6 +7,29 @@ type EventDetails = {
   timestamp?: string;
   action?: string;
   evidenceImageId?: string;
+  selectorUsed?: string;
+  fallbackUsed?: string;
+  attemptedSelectors?: string[];
+  failedSelectors?: string[];
+  detectedInputs?: Array<{
+    tag: string;
+    type: string;
+    name: string;
+    id: string;
+    placeholder: string;
+    visible: boolean;
+    disabled: boolean;
+  }>;
+  detectedButtons?: Array<{
+    tag: string;
+    text: string;
+    type: string;
+    name: string;
+    id: string;
+    value: string;
+    visible: boolean;
+    disabled: boolean;
+  }>;
   [key: string]: unknown;
 };
 
@@ -71,6 +94,15 @@ type BasicActionResponse = {
   ok?: boolean;
   message?: string;
   error?: string;
+  detail?: string;
+  diagnostic?: unknown;
+};
+
+type ParsedTextResponse = {
+  ok: boolean;
+  status: number;
+  rawText: string;
+  json: Record<string, unknown> | null;
 };
 
 function formatTimestamp(value: string | null | undefined) {
@@ -186,6 +218,40 @@ function getCalibrationEvents(events: RunDetails["events"]) {
   });
 }
 
+function getLatestDiagnosticEvent(events: RunDetails["events"]) {
+  return events.find((event) => event.event_type === "screen_diagnostic_saved") ?? null;
+}
+
+async function parseResponseAsText(response: Response): Promise<ParsedTextResponse> {
+  const rawText = await response.text();
+  const trimmed = rawText.trim();
+
+  if (!trimmed) {
+    return {
+      ok: response.ok,
+      status: response.status,
+      rawText,
+      json: null
+    };
+  }
+
+  try {
+    return {
+      ok: response.ok,
+      status: response.status,
+      rawText,
+      json: JSON.parse(trimmed) as Record<string, unknown>
+    };
+  } catch {
+    return {
+      ok: response.ok,
+      status: response.status,
+      rawText,
+      json: null
+    };
+  }
+}
+
 export function PilotRunner() {
   const [surveyUrl, setSurveyUrl] = useState(process.env.NEXT_PUBLIC_SURVEY_URL ?? "");
   const [storeCode, setStoreCode] = useState("");
@@ -207,13 +273,14 @@ export function PilotRunner() {
 
     async function loadRuns() {
       const response = await fetch("/api/pilot-runs");
-      const payload = (await response.json()) as { runs: RunSummary[] };
+      const parsed = await parseResponseAsText(response);
+      const payload = (parsed.json ?? {}) as { runs?: RunSummary[] };
 
       if (cancelled) {
         return;
       }
 
-      if (!activeRunId && payload.runs[0]?.id) {
+      if (!activeRunId && payload.runs?.[0]?.id) {
         setActiveRunId(payload.runs[0].id);
       }
     }
@@ -236,7 +303,13 @@ export function PilotRunner() {
 
     async function loadRun() {
       const response = await fetch(`/api/pilot-runs/${activeRunId}`);
-      const payload = (await response.json()) as RunDetails;
+      const parsed = await parseResponseAsText(response);
+
+      if (!parsed.json) {
+        return;
+      }
+
+      const payload = parsed.json as unknown as RunDetails;
 
       if (!cancelled) {
         setActiveRun(payload);
@@ -274,6 +347,7 @@ export function PilotRunner() {
   }, [activeRun]);
   const timelineEvents = activeRun ? getTimelineEvents(activeRun.events) : [];
   const calibrationEvents = activeRun ? getCalibrationEvents(activeRun.events).slice(0, 8) : [];
+  const latestDiagnosticEvent = activeRun ? getLatestDiagnosticEvent(activeRun.events) : null;
   const currentAction = getCurrentAction(latestEvent);
   const currentStep = activeRun
     ? getOperationalStep(activeRun.run.current_step, activeRun.run.current_question_index)
@@ -297,10 +371,11 @@ export function PilotRunner() {
         })
       });
 
-      const payload = (await response.json()) as StartRunResponse & { error?: string };
+      const parsed = await parseResponseAsText(response);
+      const payload = (parsed.json ?? {}) as StartRunResponse & { error?: string; detail?: string };
 
-      if (!response.ok) {
-        throw new Error(payload.error ?? payload.message ?? "No se pudo ejecutar el piloto.");
+      if (!parsed.ok) {
+        throw new Error(payload.detail ?? payload.error ?? payload.message ?? "No se pudo ejecutar el piloto.");
       }
 
       setActiveRunId(payload.runId);
@@ -325,10 +400,11 @@ export function PilotRunner() {
       const response = await fetch(`/api/pilot-runs/${activeRunId}/pause`, {
         method: "POST"
       });
-      const payload = (await response.json()) as { message?: string; error?: string };
+      const parsed = await parseResponseAsText(response);
+      const payload = (parsed.json ?? {}) as { message?: string; error?: string; detail?: string };
 
-      if (!response.ok) {
-        throw new Error(payload.error ?? payload.message ?? "No se pudo pausar el piloto.");
+      if (!parsed.ok) {
+        throw new Error(payload.detail ?? payload.error ?? payload.message ?? "No se pudo pausar el piloto.");
       }
 
       setStatusNotice(payload.message ?? "Piloto pausado.");
@@ -351,10 +427,11 @@ export function PilotRunner() {
       const response = await fetch(`/api/pilot-runs/${activeRunId}/stop`, {
         method: "POST"
       });
-      const payload = (await response.json()) as { message?: string; error?: string };
+      const parsed = await parseResponseAsText(response);
+      const payload = (parsed.json ?? {}) as { message?: string; error?: string; detail?: string };
 
-      if (!response.ok) {
-        throw new Error(payload.error ?? payload.message ?? "No se pudo detener el piloto.");
+      if (!parsed.ok) {
+        throw new Error(payload.detail ?? payload.error ?? payload.message ?? "No se pudo detener el piloto.");
       }
 
       setStatusNotice(payload.message ?? "Piloto detenido.");
@@ -391,10 +468,11 @@ export function PilotRunner() {
         },
         body: JSON.stringify({ selectors })
       });
-      const payload = (await response.json()) as { message?: string; error?: string };
+      const parsed = await parseResponseAsText(response);
+      const payload = (parsed.json ?? {}) as { message?: string; error?: string; detail?: string };
 
-      if (!response.ok) {
-        throw new Error(payload.error ?? payload.message ?? "No se pudo guardar la calibración.");
+      if (!parsed.ok) {
+        throw new Error(payload.detail ?? payload.error ?? payload.message ?? "No se pudo guardar la calibración.");
       }
 
       setSelectorDraftsRunId(null);
@@ -424,13 +502,30 @@ export function PilotRunner() {
           action: "diagnose"
         })
       });
-      const payload = (await response.json()) as BasicActionResponse;
+      const parsed = await parseResponseAsText(response);
+      const payload = (parsed.json ?? {}) as BasicActionResponse;
 
-      if (!response.ok) {
-        throw new Error(payload.error ?? payload.message ?? "No se pudo ejecutar el diagnóstico.");
+      if (!parsed.ok) {
+        if (!parsed.rawText.trim()) {
+          throw new Error(
+            `Diagnóstico falló con status ${parsed.status} en /api/pilot-runs/${activeRunId}. Respuesta vacía.`
+          );
+        }
+
+        if (!parsed.json) {
+          throw new Error(
+            `Diagnóstico falló con status ${parsed.status} en /api/pilot-runs/${activeRunId}. Body crudo: ${parsed.rawText}`
+          );
+        }
+
+        throw new Error(payload.detail ?? payload.error ?? payload.message ?? "No se pudo ejecutar el diagnóstico.");
       }
 
-      setStatusNotice(payload.message ?? "Diagnóstico ejecutado.");
+      setStatusNotice(
+        payload.diagnostic
+          ? "Diagnóstico ejecutado. Revisa inputs, botones y captura en el panel."
+          : "Diagnóstico ejecutado."
+      );
     } catch (error) {
       setErrorNotice(error instanceof Error ? error.message : "No se pudo ejecutar el diagnóstico.");
     } finally {
@@ -714,6 +809,62 @@ export function PilotRunner() {
           )}
         </div>
       </section>
+
+      {latestDiagnosticEvent ? (
+        <section className="card timeline-panel">
+          <div className="panel-header">
+            <span className="eyebrow">Diagnóstico</span>
+            <h2>Pantalla actual</h2>
+          </div>
+          <div className="timeline-list">
+            <article className="timeline-item">
+              <span className="timeline-time">{formatTimestamp(latestDiagnosticEvent.created_at)}</span>
+              <strong>{latestDiagnosticEvent.message}</strong>
+              {typeof latestDiagnosticEvent.details?.selectorUsed === "string" ? (
+                <span className="timeline-step">Selector intentado: {latestDiagnosticEvent.details.selectorUsed}</span>
+              ) : null}
+              {Array.isArray(latestDiagnosticEvent.details?.attemptedSelectors) ? (
+                <span className="timeline-step">
+                  Intentos: {latestDiagnosticEvent.details.attemptedSelectors.join(" | ")}
+                </span>
+              ) : null}
+              {typeof latestDiagnosticEvent.details?.fallbackUsed === "string" ? (
+                <span className="timeline-step">Fallback usado: {latestDiagnosticEvent.details.fallbackUsed}</span>
+              ) : null}
+            </article>
+          </div>
+          <div className="advanced-grid">
+            <div className="field">
+              <label>Inputs detectados</label>
+              <div className="diagnostic-list">
+                {latestDiagnosticEvent.details?.detectedInputs?.length ? (
+                  latestDiagnosticEvent.details.detectedInputs.map((input, index) => (
+                    <div key={`input-${index}`} className="diagnostic-item">
+                      {`${input.tag} type=${input.type || "-"} name=${input.name || "-"} id=${input.id || "-"} placeholder=${input.placeholder || "-"} visible=${String(input.visible)} disabled=${String(input.disabled)}`}
+                    </div>
+                  ))
+                ) : (
+                  <div className="timeline-empty">No hay inputs diagnosticados.</div>
+                )}
+              </div>
+            </div>
+            <div className="field">
+              <label>Botones detectados</label>
+              <div className="diagnostic-list">
+                {latestDiagnosticEvent.details?.detectedButtons?.length ? (
+                  latestDiagnosticEvent.details.detectedButtons.map((button, index) => (
+                    <div key={`button-${index}`} className="diagnostic-item">
+                      {`${button.tag} text=${button.text || button.value || "-"} type=${button.type || "-"} visible=${String(button.visible)} disabled=${String(button.disabled)}`}
+                    </div>
+                  ))
+                ) : (
+                  <div className="timeline-empty">No hay botones diagnosticados.</div>
+                )}
+              </div>
+            </div>
+          </div>
+        </section>
+      ) : null}
     </section>
   );
 }

@@ -2,7 +2,7 @@ import { NextResponse } from "next/server";
 import { createSupabaseAdminClient } from "@/lib/supabase/admin";
 import { mergePilotBrowserConfig } from "@/lib/pilot/config";
 import { createBrowserEvent, getSurveyRunDetails, updateSurveyRun } from "@/lib/pilot/db";
-import { diagnosePilotRunScreen } from "@/lib/pilot/worker";
+import { diagnoseRemotePilotRun } from "@/lib/pilot/worker-backend";
 import type { SurveySelectorConfig } from "@/lib/pilot/types";
 
 export const runtime = "nodejs";
@@ -61,33 +61,52 @@ export async function PATCH(request: Request, context: { params: Promise<{ runId
 
 export async function POST(request: Request, context: { params: Promise<{ runId: string }> }) {
   const { runId } = await context.params;
-  const body = (await request.json().catch(() => ({}))) as {
-    action?: string;
-  };
 
-  if (body.action !== "diagnose") {
-    return NextResponse.json({ error: "unsupported_action" }, { status: 400 });
-  }
+  try {
+    const body = (await request.json().catch(() => ({}))) as {
+      action?: string;
+    };
 
-  await diagnosePilotRunScreen(runId);
-
-  await updateSurveyRun(runId, {
-    current_step: "diagnostics"
-  });
-
-  await createBrowserEvent({
-    surveyRunId: runId,
-    eventType: "screen_diagnosis_requested",
-    message: "Diagnóstico manual ejecutado sobre la pantalla actual.",
-    details: {
-      runId,
-      step: "diagnostics",
-      timestamp: new Date().toISOString()
+    if (body.action !== "diagnose") {
+      return NextResponse.json(
+        {
+          ok: false,
+          error: "unsupported_action",
+          detail: "La acción solicitada no es válida."
+        },
+        { status: 400 }
+      );
     }
-  });
 
-  return NextResponse.json({
-    ok: true,
-    message: "Diagnóstico ejecutado. Revisa la línea de tiempo y la captura más reciente."
-  });
+    const diagnostic = await diagnoseRemotePilotRun(runId);
+
+    await updateSurveyRun(runId, {
+      current_step: "diagnostics"
+    });
+
+    await createBrowserEvent({
+      surveyRunId: runId,
+      eventType: "screen_diagnosis_requested",
+      message: "Diagnóstico manual ejecutado sobre la pantalla actual.",
+      details: {
+        runId,
+        step: "diagnostics",
+        timestamp: new Date().toISOString()
+      }
+    });
+
+    return NextResponse.json({
+      ok: true,
+      diagnostic
+    });
+  } catch (error) {
+    return NextResponse.json(
+      {
+        ok: false,
+        error: "diagnostic_failed",
+        detail: error instanceof Error ? error.message : "No se pudo ejecutar el diagnóstico remoto."
+      },
+      { status: 500 }
+    );
+  }
 }
