@@ -170,6 +170,22 @@ function buildHtmlArtifactPath(runId: string, name: string) {
   return path.posix.join("runs", runId, "artifacts", `${name}.html`);
 }
 
+function buildWorkerTraceContext(
+  runId: string,
+  currentStep: string,
+  extra?: {
+    sourceUrl?: string;
+    contentType?: string;
+  }
+) {
+  return {
+    runId,
+    currentStep,
+    sourceUrl: extra?.sourceUrl,
+    contentType: extra?.contentType
+  };
+}
+
 function serializeUnknownError(error: unknown, seen = new WeakSet<object>()): SerializedError {
   if (error instanceof Error) {
     return {
@@ -390,11 +406,13 @@ async function collectScreenDiagnostics(page: Page): Promise<ScreenDiagnostics> 
 async function uploadHtmlArtifact({
   runId,
   name,
-  html
+  html,
+  step
 }: {
   runId: string;
   name: string;
   html: string;
+  step?: string;
 }) {
   const filePath = buildHtmlArtifactPath(runId, name);
 
@@ -402,7 +420,10 @@ async function uploadHtmlArtifact({
     bucket: STORAGE_BUCKETS.analysisArtifacts,
     filePath,
     buffer: Buffer.from(html, "utf8"),
-    contentType: "text/html; charset=utf-8"
+    contentType: "text/html; charset=utf-8",
+    traceContext: buildWorkerTraceContext(runId, step ?? "unknown", {
+      contentType: "text/html; charset=utf-8"
+    })
   });
 
   return {
@@ -437,12 +458,14 @@ async function recordScreenDiagnostics({
   const htmlArtifact = await uploadHtmlArtifact({
     runId,
     name,
-    html: diagnostics.htmlPartial
+    html: diagnostics.htmlPartial,
+    step
   });
   const jsonArtifact = await uploadJsonArtifact({
     runId,
     name,
-    payload: diagnostics
+    payload: diagnostics,
+    traceContext: buildWorkerTraceContext(runId, step)
   });
 
   await emitWorkerEvent({
@@ -960,12 +983,14 @@ async function captureAndUploadScreenshot({
   page,
   runId,
   fileName,
-  bucket
+  bucket,
+  step
 }: {
   page: Page;
   runId: string;
   fileName: string;
   bucket: string;
+  step?: string;
 }) {
   const buffer = await page.screenshot({
     fullPage: true,
@@ -977,7 +1002,10 @@ async function captureAndUploadScreenshot({
     bucket,
     filePath: storagePath,
     buffer,
-    contentType: "image/png"
+    contentType: "image/png",
+    traceContext: buildWorkerTraceContext(runId, step ?? "unknown", {
+      contentType: "image/png"
+    })
   });
 
   return {
@@ -1062,7 +1090,8 @@ async function captureActionScreenshot({
     page,
     runId,
     fileName,
-    bucket: STORAGE_BUCKETS.analysisArtifacts
+    bucket: STORAGE_BUCKETS.analysisArtifacts,
+    step
   });
 
   await setCurrentBrowserScreenshot({
@@ -1122,7 +1151,10 @@ async function captureRawInitialScreenshot({
       bucket: STORAGE_BUCKETS.analysisArtifacts,
       filePath: storagePath,
       buffer,
-      contentType: "image/png"
+      contentType: "image/png",
+      traceContext: buildWorkerTraceContext(runId, step, {
+        contentType: "image/png"
+      })
     });
 
     await setCurrentBrowserScreenshot({
@@ -1193,7 +1225,10 @@ function startLiveBrowserView({
         bucket: STORAGE_BUCKETS.analysisArtifacts,
         filePath: storagePath,
         buffer,
-        contentType: "image/png"
+        contentType: "image/png",
+        traceContext: buildWorkerTraceContext(runId, "live_browser", {
+          contentType: "image/png"
+        })
       });
 
       await setCurrentBrowserScreenshot({
@@ -1319,8 +1354,8 @@ async function selectUsedImages(page: Page, selectors: SurveySelectorConfig, use
   return selected;
 }
 
-async function persistExtractedImage(runId: string, sourceUrl: string, index: number) {
-  const remote = await fetchBinaryImage(sourceUrl);
+async function persistExtractedImage(runId: string, sourceUrl: string, index: number, currentStep: string) {
+  const remote = await fetchBinaryImage(sourceUrl, buildWorkerTraceContext(runId, currentStep, { sourceUrl }));
   const extension = remote.mimeType.split("/")[1] ?? "jpg";
   const storagePath = path.posix.join("runs", runId, "source-images", `image-${index + 1}.${extension}`);
 
@@ -1328,7 +1363,11 @@ async function persistExtractedImage(runId: string, sourceUrl: string, index: nu
     bucket: STORAGE_BUCKETS.surveyImages,
     filePath: storagePath,
     buffer: remote.buffer,
-    contentType: remote.mimeType
+    contentType: remote.mimeType,
+    traceContext: buildWorkerTraceContext(runId, currentStep, {
+      sourceUrl,
+      contentType: remote.mimeType
+    })
   });
 
   const imageRecordId = await createImageRecord({
@@ -1851,7 +1890,7 @@ export async function runPilotSurvey(runId: string) {
           }
         });
 
-        const extracted = await persistExtractedImage(runId, sourceUrl, index);
+        const extracted = await persistExtractedImage(runId, sourceUrl, index, "validator_screen");
         extractedImages.push(extracted);
         await emitWorkerEvent({
           runId,
@@ -2013,7 +2052,8 @@ export async function runPilotSurvey(runId: string) {
         page,
         runId,
         fileName: `question-${questionIndex + 1}.png`,
-        bucket: STORAGE_BUCKETS.questionScreenshots
+        bucket: STORAGE_BUCKETS.questionScreenshots,
+        step: `question_${questionIndex + 1}`
       });
       await setCurrentBrowserScreenshot({
         runId,
@@ -2101,7 +2141,11 @@ export async function runPilotSurvey(runId: string) {
           questionnaireImage: screenshot.buffer,
           questionnaireImageMimeType: "image/png",
           questionnaireFilename: `question-${questionIndex + 1}.png`,
-          manualQuestion: questionText
+          manualQuestion: questionText,
+          traceContext: buildWorkerTraceContext(runId, `question_${questionIndex + 1}`, {
+            sourceUrl: image.signedUrl,
+            contentType: "image/png"
+          })
         });
 
         analyses.push({
@@ -2232,6 +2276,7 @@ export async function runPilotSurvey(runId: string) {
       await uploadJsonArtifact({
         runId,
         name: `question-${questionIndex + 1}-analysis`,
+        traceContext: buildWorkerTraceContext(runId, `question_${questionIndex + 1}`),
         payload: analyses.map((item) => ({
           imageRecordId: item.image.imageRecordId,
           sourceUrl: item.image.sourceUrl,
@@ -2513,7 +2558,8 @@ export async function runPilotSurvey(runId: string) {
       page,
       runId,
       fileName: "fatal-error.png",
-      bucket: STORAGE_BUCKETS.errorScreenshots
+      bucket: STORAGE_BUCKETS.errorScreenshots,
+      step: runtimeState.currentStep || "failed"
     }).catch(() => null);
 
     if (screenshot) {
@@ -2538,7 +2584,8 @@ export async function runPilotSurvey(runId: string) {
       ? await uploadHtmlArtifact({
           runId,
           name: `fatal-error-${Date.now()}`,
-          html: htmlPartial
+          html: htmlPartial,
+          step: runtimeState.currentStep || "failed"
         }).catch(() => null)
       : null;
     const failureContext = {
@@ -2678,7 +2725,8 @@ export async function diagnosePilotRunScreen(runId: string) {
       page,
       runId,
       fileName: `diagnostic-error-${Date.now()}.png`,
-      bucket: STORAGE_BUCKETS.analysisArtifacts
+      bucket: STORAGE_BUCKETS.analysisArtifacts,
+      step: "diagnostics"
     }).catch(() => null);
 
     if (screenshot) {

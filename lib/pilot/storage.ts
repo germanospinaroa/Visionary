@@ -2,38 +2,98 @@ import path from "node:path";
 import { createSupabaseAdminClient } from "@/lib/supabase/admin";
 import { STORAGE_BUCKETS } from "@/lib/supabase/storage";
 
+type StorageTraceContext = {
+  runId?: string;
+  currentStep?: string;
+  sourceUrl?: string;
+  contentType?: string;
+  functionName?: string;
+};
+
+function logStorageTrace(
+  level: "info" | "error",
+  functionName: string,
+  message: string,
+  context: StorageTraceContext = {},
+  error?: unknown
+) {
+  const payload = {
+    scope: "lib/pilot/storage",
+    level,
+    functionName,
+    message,
+    runId: context.runId ?? null,
+    currentStep: context.currentStep ?? null,
+    sourceUrl: context.sourceUrl ?? null,
+    contentType: context.contentType ?? null,
+    errorMessage: error instanceof Error ? error.message : null,
+    errorStack: error instanceof Error ? error.stack ?? null : null,
+    timestamp: new Date().toISOString()
+  };
+
+  if (level === "error") {
+    console.error(JSON.stringify(payload));
+    return;
+  }
+
+  console.log(JSON.stringify(payload));
+}
+
 export async function uploadBufferToStorage({
   bucket,
   filePath,
   buffer,
-  contentType
+  contentType,
+  traceContext
 }: {
   bucket: string;
   filePath: string;
   buffer: Buffer;
   contentType: string;
+  traceContext?: StorageTraceContext;
 }) {
-  const supabase = createSupabaseAdminClient();
-  const { error } = await supabase.storage.from(bucket).upload(filePath, buffer, {
-    contentType,
-    upsert: true
+  logStorageTrace("info", "uploadBufferToStorage", "uploadBufferToStorage:start", {
+    ...traceContext,
+    contentType
   });
 
-  if (error) {
+  try {
+    const supabase = createSupabaseAdminClient();
+    const { error } = await supabase.storage.from(bucket).upload(filePath, buffer, {
+      contentType,
+      upsert: true
+    });
+
+    if (error) {
+      throw error;
+    }
+
+    return filePath;
+  } catch (error) {
+    logStorageTrace(
+      "error",
+      "uploadBufferToStorage",
+      "uploadBufferToStorage:error",
+      {
+        ...traceContext,
+        contentType
+      },
+      error
+    );
     throw error;
   }
-
-  return filePath;
 }
 
 export async function uploadJsonArtifact({
   runId,
   name,
-  payload
+  payload,
+  traceContext
 }: {
   runId: string;
   name: string;
   payload: unknown;
+  traceContext?: StorageTraceContext;
 }) {
   const buffer = Buffer.from(JSON.stringify(payload, null, 2), "utf8");
   const filePath = path.posix.join("runs", runId, "artifacts", `${name}.json`);
@@ -42,7 +102,11 @@ export async function uploadJsonArtifact({
     bucket: STORAGE_BUCKETS.analysisArtifacts,
     filePath,
     buffer,
-    contentType: "application/json"
+    contentType: "application/json",
+    traceContext: {
+      ...traceContext,
+      runId
+    }
   });
 
   return {

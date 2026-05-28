@@ -93,7 +93,8 @@ export async function runVisualAnalysis({
   questionnaireImageMimeType,
   questionnaireFilename,
   manualQuestion = "",
-  additionalContext = ""
+  additionalContext = "",
+  traceContext
 }: {
   mainImageUrl: string;
   questionnaireImage: Buffer;
@@ -101,6 +102,12 @@ export async function runVisualAnalysis({
   questionnaireFilename?: string;
   manualQuestion?: string;
   additionalContext?: string;
+  traceContext?: {
+    runId?: string;
+    currentStep?: string;
+    sourceUrl?: string;
+    contentType?: string;
+  };
 }) {
   const normalizedMainImageUrl = assertValidHttpUrl(mainImageUrl.trim());
   const registryRule = classifyQuestion(manualQuestion);
@@ -110,11 +117,18 @@ export async function runVisualAnalysis({
   });
 
   const [mainImage, questionnaireDataUrl] = await Promise.all([
-    fetchRemoteImage(normalizedMainImageUrl),
+    fetchRemoteImage(normalizedMainImageUrl, {
+      ...traceContext,
+      sourceUrl: normalizedMainImageUrl
+    }),
     fileToDataUrl(file)
   ]);
 
-  const mainImageAssets = await buildMainImageAssets(mainImage.buffer, mainImage.mimeType);
+  const mainImageAssets = await buildMainImageAssets(mainImage.buffer, mainImage.mimeType, {
+    ...traceContext,
+    sourceUrl: normalizedMainImageUrl,
+    contentType: mainImage.mimeType
+  });
 
   const imageInputs: ImageInput[] = [
     {
