@@ -88,6 +88,7 @@ type StartRunResponse = {
   runId: string;
   launchAccepted: boolean;
   message: string;
+  detail?: string | null;
 };
 
 type BasicActionResponse = {
@@ -379,7 +380,12 @@ export function PilotRunner() {
       }
 
       setActiveRunId(payload.runId);
-      setStatusNotice(payload.message);
+
+      if (payload.launchAccepted === false) {
+        setErrorNotice(payload.detail ?? payload.message);
+      } else {
+        setStatusNotice(payload.message);
+      }
     } catch (error) {
       setStatusNotice(null);
       setErrorNotice(error instanceof Error ? error.message : "No se pudo ejecutar el piloto.");

@@ -44,6 +44,7 @@ export async function POST(request: Request) {
 
   let launchAccepted = true;
   let message = "Piloto enviado. El agente está iniciando la navegación.";
+  let detail: string | null = null;
 
   try {
     await startRemotePilotRun(run.id);
@@ -60,11 +61,12 @@ export async function POST(request: Request) {
   } catch (error) {
     launchAccepted = false;
     message = "No se pudo iniciar la automatización del piloto.";
+    detail = error instanceof Error ? error.message : "No se pudo iniciar la automatización del piloto.";
 
     await updateSurveyRun(run.id, {
       status: "failed",
       current_step: "dispatch_failed",
-      last_error: error instanceof Error ? error.message : "No se pudo iniciar la automatización del piloto."
+      last_error: detail
     });
 
     await createBrowserEvent({
@@ -75,7 +77,8 @@ export async function POST(request: Request) {
       details: {
         runId: run.id,
         step: "dispatch_failed",
-        timestamp: new Date().toISOString()
+        timestamp: new Date().toISOString(),
+        detail
       }
     });
   }
@@ -83,6 +86,7 @@ export async function POST(request: Request) {
   return NextResponse.json({
     runId: run.id,
     launchAccepted,
-    message
+    message,
+    detail
   });
 }

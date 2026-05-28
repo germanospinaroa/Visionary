@@ -12,26 +12,53 @@ async function parseJsonResponse(response: Response) {
   }
 }
 
+async function parseTextResponse(response: Response) {
+  try {
+    return await response.text();
+  } catch {
+    return "";
+  }
+}
+
 async function callWorkerApi(path: string, init?: RequestInit) {
   const baseUrl = getWorkerApiBaseUrl();
-  const response = await fetch(`${baseUrl}${path}`, {
-    ...init,
-    headers: {
-      "content-type": "application/json",
-      ...(init?.headers ?? {})
-    },
-    cache: "no-store"
-  });
+  const targetUrl = `${baseUrl}${path}`;
 
+  let response: Response;
+
+  try {
+    response = await fetch(targetUrl, {
+      ...init,
+      headers: {
+        "content-type": "application/json",
+        ...(init?.headers ?? {})
+      },
+      cache: "no-store"
+    });
+  } catch (error) {
+    const reason = error instanceof Error ? error.message : "unknown_fetch_error";
+    throw new Error(`Fetch al worker falló: ${targetUrl}. Detalle: ${reason}`);
+  }
+
+  const clonedResponse = response.clone();
   const payload = await parseJsonResponse(response);
+  const rawBody = await parseTextResponse(clonedResponse);
 
   if (!response.ok) {
-    const message =
-      typeof payload.message === "string"
-        ? payload.message
-        : "No se pudo comunicar el servicio operativo del agente.";
+    const messageParts = [
+      `Worker respondió error: ${response.status} ${response.statusText}.`,
+      `URL: ${targetUrl}.`
+    ];
 
-    throw new Error(message);
+    if (typeof payload.detail === "string" && payload.detail.trim()) {
+      messageParts.push(`Detalle: ${payload.detail}`);
+    } else if (typeof payload.message === "string" && payload.message.trim()) {
+      messageParts.push(`Detalle: ${payload.message}`);
+    } else if (rawBody.trim()) {
+      messageParts.push(`Body: ${rawBody}`);
+    }
+
+    throw new Error(messageParts.join(" "));
   }
 
   return payload;

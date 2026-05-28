@@ -23,6 +23,7 @@ type ActiveRun = {
 };
 
 const activeRuns = new Map<string, ActiveRun>();
+const allowedOrigin = "https://visual-validator-mvp.vercel.app";
 
 function log(level: "info" | "warn" | "error", message: string, extra?: Record<string, unknown>) {
   const payload = {
@@ -46,6 +47,16 @@ function log(level: "info" | "warn" | "error", message: string, extra?: Record<s
   }
 
   console.log(serialized);
+}
+
+function setCorsHeaders(request: IncomingMessage, response: ServerResponse) {
+  const origin = request.headers.origin;
+  const allowOrigin = origin === allowedOrigin ? origin : allowedOrigin;
+  response.setHeader("access-control-allow-origin", allowOrigin);
+  response.setHeader("access-control-allow-methods", "GET, POST, OPTIONS");
+  response.setHeader("access-control-allow-headers", "content-type, authorization");
+  response.setHeader("access-control-max-age", "86400");
+  response.setHeader("vary", "Origin");
 }
 
 function assertRequiredEnv() {
@@ -182,6 +193,12 @@ async function handleStartRun(request: IncomingMessage, response: ServerResponse
   const body = await readJsonBody(request);
   const runId = typeof body.runId === "string" ? body.runId : "";
 
+  log("info", "Start run payload received.", {
+    path: "/runs/start",
+    origin: request.headers.origin ?? null,
+    body
+  });
+
   if (!runId) {
     writeJson(response, 400, {
       message: "runId es obligatorio."
@@ -218,30 +235,52 @@ async function handleStartRun(request: IncomingMessage, response: ServerResponse
     activeRuns: activeRuns.size
   });
 
-  writeJson(response, 202, {
+  const payload = {
     ok: true,
     runId,
     message: "Piloto aceptado por el servicio operativo."
+  };
+  writeJson(response, 202, payload);
+  log("info", "Request completed.", {
+    method: "POST",
+    path: "/runs/start",
+    origin: request.headers.origin ?? null,
+    status: 202,
+    body: payload
   });
 }
 
 async function handlePauseRun(runId: string, response: ServerResponse) {
   await markControlEvent(runId, "pause_requested", "Pausa solicitada por operador.", "paused", "pause_requested");
   log("warn", "Pause requested.", { runId });
-  writeJson(response, 200, {
+  const payload = {
     ok: true,
     runId,
     message: "Pausa solicitada."
+  };
+  writeJson(response, 200, payload);
+  log("info", "Request completed.", {
+    method: "POST",
+    path: `/runs/${runId}/pause`,
+    status: 200,
+    body: payload
   });
 }
 
 async function handleStopRun(runId: string, response: ServerResponse) {
   await markControlEvent(runId, "stop_requested", "Detención solicitada por operador.", "failed", "stop_requested");
   log("warn", "Stop requested.", { runId });
-  writeJson(response, 200, {
+  const payload = {
     ok: true,
     runId,
     message: "Detención solicitada."
+  };
+  writeJson(response, 200, payload);
+  log("info", "Request completed.", {
+    method: "POST",
+    path: `/runs/${runId}/stop`,
+    status: 200,
+    body: payload
   });
 }
 
@@ -249,7 +288,7 @@ async function handleStatusRun(runId: string, response: ServerResponse) {
   const details = await getSurveyRunDetails(runId);
   const active = activeRuns.get(runId);
 
-  writeJson(response, 200, {
+  const payload = {
     ok: true,
     runId,
     status: details.run.status,
@@ -259,6 +298,13 @@ async function handleStatusRun(runId: string, response: ServerResponse) {
     currentScreenshotUrl: details.currentScreenshotUrl,
     active: Boolean(active),
     startedAt: active ? new Date(active.startedAt).toISOString() : null
+  };
+  writeJson(response, 200, payload);
+  log("info", "Request completed.", {
+    method: "GET",
+    path: `/runs/${runId}/status`,
+    status: 200,
+    body: payload
   });
 }
 
@@ -267,32 +313,64 @@ async function handleDiagnoseRun(runId: string, response: ServerResponse) {
 
   log("info", "Pilot screen diagnosed.", { runId });
 
-  writeJson(response, 200, {
+  const payload = {
     ok: true,
     runId,
     diagnostic
+  };
+  writeJson(response, 200, payload);
+  log("info", "Request completed.", {
+    method: "POST",
+    path: `/runs/${runId}/diagnose`,
+    status: 200,
+    body: payload
   });
 }
 
 const server = createServer(async (request, response) => {
   const method = request.method ?? "GET";
   const url = new URL(request.url ?? "/", `http://${request.headers.host ?? `127.0.0.1:${port}`}`);
+  const origin = request.headers.origin ?? null;
+
+  setCorsHeaders(request, response);
 
   log("info", "Incoming request.", {
     method,
-    path: url.pathname
+    path: url.pathname,
+    origin
   });
 
   try {
+    if (method === "OPTIONS") {
+      response.statusCode = 204;
+      response.end();
+      log("info", "Preflight request handled.", {
+        method,
+        path: url.pathname,
+        origin,
+        status: 204
+      });
+      return;
+    }
+
     if (method === "GET" && url.pathname === "/health") {
       const dependencies = await getDependencyHealth();
       const ok = dependencies.supabase === "ok" && dependencies.openai === "ok";
 
-      writeJson(response, ok ? 200 : 503, {
+      const status = ok ? 200 : 503;
+      const payload = {
         ok,
         activeRuns: activeRuns.size,
         maxConcurrentRuns,
         dependencies
+      };
+      writeJson(response, status, payload);
+      log("info", "Request completed.", {
+        method,
+        path: url.pathname,
+        origin,
+        status,
+        body: payload
       });
       return;
     }
@@ -326,21 +404,40 @@ const server = createServer(async (request, response) => {
       return;
     }
 
-    writeJson(response, 404, {
-      message: "Ruta no encontrada."
+    const payload = {
+      ok: false,
+      error: "route_not_found",
+      detail: "Ruta no encontrada."
+    };
+    writeJson(response, 404, payload);
+    log("warn", "Request completed.", {
+      method,
+      path: url.pathname,
+      origin,
+      status: 404,
+      body: payload
     });
   } catch (error) {
     const message = error instanceof Error ? error.message : "Error interno del servicio operativo.";
     log("error", "Request failed.", {
       method,
       path: url.pathname,
+      origin,
       error: message
     });
 
-    writeJson(response, 500, {
+    const payload = {
       ok: false,
       error: "worker_service_error",
       detail: message
+    };
+    writeJson(response, 500, payload);
+    log("error", "Error response returned.", {
+      method,
+      path: url.pathname,
+      origin,
+      status: 500,
+      body: payload
     });
   }
 });
