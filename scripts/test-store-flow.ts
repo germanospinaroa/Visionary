@@ -428,39 +428,53 @@ async function findEntryButton(page: Page) {
 }
 
 async function installListenerProbe(page: Page) {
-  await page.addInitScript(() => {
-    const globalKey = "__storeFlowListeners";
-    const relevantTypes = new Set(["input", "change", "blur", "focus", "keypress", "keydown", "keyup", "click", "submit"]);
+  await page.addInitScript({
+    content: `
+      window.__storeFlowListeners = [];
+      window.__storeFlowOriginalAddEventListener = EventTarget.prototype.addEventListener;
+      EventTarget.prototype.addEventListener = function(type, listener, options) {
+        if (
+          type === "input" ||
+          type === "change" ||
+          type === "blur" ||
+          type === "focus" ||
+          type === "keypress" ||
+          type === "keydown" ||
+          type === "keyup" ||
+          type === "click" ||
+          type === "submit"
+        ) {
+          var target = this;
+          var tagName = "";
+          var id = "";
+          var name = "";
+          var role = "";
 
-    const recorder = (window as typeof window & { [key: string]: unknown }) as {
-      __storeFlowListeners?: Array<Record<string, string>>;
-    };
+          if (target && typeof target.tagName === "string") {
+            tagName = target.tagName.toLowerCase();
+          }
 
-    recorder.__storeFlowListeners = [];
+          if (target && typeof target.id === "string") {
+            id = target.id;
+          }
 
-    const originalAddEventListener = EventTarget.prototype.addEventListener;
-    EventTarget.prototype.addEventListener = function patchedAddEventListener(
-      type: string,
-      listener: EventListenerOrEventListenerObject | null,
-      options?: boolean | AddEventListenerOptions
-    ) {
-      if (relevantTypes.has(type)) {
-        const target = this as EventTarget & Partial<HTMLElement> & Partial<Document> & Partial<Window>;
-        recorder.__storeFlowListeners?.push({
-          type,
-          targetTag: "tagName" in target && typeof target.tagName === "string" ? target.tagName.toLowerCase() : "",
-          targetId: "id" in target && typeof target.id === "string" ? target.id : "",
-          targetName:
-            "getAttribute" in target && typeof target.getAttribute === "function" ? target.getAttribute("name") ?? "" : "",
-          targetRole:
-            "getAttribute" in target && typeof target.getAttribute === "function" ? target.getAttribute("role") ?? "" : ""
-        });
-      }
+          if (target && typeof target.getAttribute === "function") {
+            name = target.getAttribute("name") || "";
+            role = target.getAttribute("role") || "";
+          }
 
-      return originalAddEventListener.call(this, type, listener, options);
-    };
+          window.__storeFlowListeners.push({
+            type: type,
+            targetTag: tagName,
+            targetId: id,
+            targetName: name,
+            targetRole: role
+          });
+        }
 
-    (window as typeof window & { [key: string]: unknown })[globalKey] = recorder.__storeFlowListeners;
+        return window.__storeFlowOriginalAddEventListener.call(this, type, listener, options);
+      };
+    `
   });
 }
 
@@ -551,26 +565,96 @@ async function collectListenerSummaryForIndexes(frame: Frame, inputIndex: number
       const input = inputs[resolvedInputIndex] as HTMLElement | undefined;
       const button = buttons[resolvedButtonIndex] as HTMLElement | undefined;
       const form = input && "form" in input ? ((input as HTMLInputElement).form as HTMLFormElement | null) : null;
+      const listeners = ((window as typeof window & { __storeFlowListeners?: Array<Record<string, string>> }).__storeFlowListeners ?? []).slice(
+        -200
+      );
+      let inputInlineHandlers: Record<string, boolean>;
+      let buttonInlineHandlers: Record<string, boolean>;
+      let formInlineHandlers: Record<string, boolean>;
 
-      const readHandlers = (element: HTMLElement | HTMLFormElement | null) => ({
-        onfocus: Boolean(element && "onfocus" in element && element.onfocus),
-        oninput: Boolean(element && "oninput" in element && element.oninput),
-        onchange: Boolean(element && "onchange" in element && element.onchange),
-        onblur: Boolean(element && "onblur" in element && element.onblur),
-        onkeypress: Boolean(element && "onkeypress" in element && element.onkeypress),
-        onkeydown: Boolean(element && "onkeydown" in element && element.onkeydown),
-        onkeyup: Boolean(element && "onkeyup" in element && element.onkeyup),
-        onclick: Boolean(element && "onclick" in element && element.onclick),
-        onsubmit: Boolean(element && "onsubmit" in element && element.onsubmit)
-      });
+      if (input) {
+        inputInlineHandlers = {
+          onfocus: Boolean("onfocus" in input && input.onfocus),
+          oninput: Boolean("oninput" in input && input.oninput),
+          onchange: Boolean("onchange" in input && input.onchange),
+          onblur: Boolean("onblur" in input && input.onblur),
+          onkeypress: Boolean("onkeypress" in input && input.onkeypress),
+          onkeydown: Boolean("onkeydown" in input && input.onkeydown),
+          onkeyup: Boolean("onkeyup" in input && input.onkeyup),
+          onclick: Boolean("onclick" in input && input.onclick),
+          onsubmit: Boolean("onsubmit" in input && input.onsubmit)
+        };
+      } else {
+        inputInlineHandlers = {
+          onfocus: false,
+          oninput: false,
+          onchange: false,
+          onblur: false,
+          onkeypress: false,
+          onkeydown: false,
+          onkeyup: false,
+          onclick: false,
+          onsubmit: false
+        };
+      }
+
+      if (button) {
+        buttonInlineHandlers = {
+          onfocus: Boolean("onfocus" in button && button.onfocus),
+          oninput: Boolean("oninput" in button && button.oninput),
+          onchange: Boolean("onchange" in button && button.onchange),
+          onblur: Boolean("onblur" in button && button.onblur),
+          onkeypress: Boolean("onkeypress" in button && button.onkeypress),
+          onkeydown: Boolean("onkeydown" in button && button.onkeydown),
+          onkeyup: Boolean("onkeyup" in button && button.onkeyup),
+          onclick: Boolean("onclick" in button && button.onclick),
+          onsubmit: Boolean("onsubmit" in button && button.onsubmit)
+        };
+      } else {
+        buttonInlineHandlers = {
+          onfocus: false,
+          oninput: false,
+          onchange: false,
+          onblur: false,
+          onkeypress: false,
+          onkeydown: false,
+          onkeyup: false,
+          onclick: false,
+          onsubmit: false
+        };
+      }
+
+      if (form) {
+        formInlineHandlers = {
+          onfocus: Boolean("onfocus" in form && form.onfocus),
+          oninput: Boolean("oninput" in form && form.oninput),
+          onchange: Boolean("onchange" in form && form.onchange),
+          onblur: Boolean("onblur" in form && form.onblur),
+          onkeypress: Boolean("onkeypress" in form && form.onkeypress),
+          onkeydown: Boolean("onkeydown" in form && form.onkeydown),
+          onkeyup: Boolean("onkeyup" in form && form.onkeyup),
+          onclick: Boolean("onclick" in form && form.onclick),
+          onsubmit: Boolean("onsubmit" in form && form.onsubmit)
+        };
+      } else {
+        formInlineHandlers = {
+          onfocus: false,
+          oninput: false,
+          onchange: false,
+          onblur: false,
+          onkeypress: false,
+          onkeydown: false,
+          onkeyup: false,
+          onclick: false,
+          onsubmit: false
+        };
+      }
 
       return {
-        registeredListeners: ((window as typeof window & { __storeFlowListeners?: Array<Record<string, string>> }).__storeFlowListeners ?? []).slice(
-          -200
-        ),
-        inputInlineHandlers: readHandlers(input ?? null),
-        buttonInlineHandlers: readHandlers(button ?? null),
-        formInlineHandlers: readHandlers(form)
+        registeredListeners: listeners,
+        inputInlineHandlers,
+        buttonInlineHandlers,
+        formInlineHandlers
       };
     },
     { resolvedInputIndex: inputIndex, resolvedButtonIndex: buttonIndex }
