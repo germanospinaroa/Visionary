@@ -7,6 +7,7 @@
     "build": "next build",
     "start": "next start",
     "lint": "next lint",
+    "test:store-flow": "tsx scripts/test-store-flow.ts",
     "supabase:provision-storage": "node scripts/provision-supabase-storage.mjs",
     "supabase:validate": "node scripts/validate-supabase.mjs",
     "pilot:worker": "tsx scripts/run-pilot-worker.ts",
