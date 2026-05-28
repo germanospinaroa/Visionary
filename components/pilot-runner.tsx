@@ -13,6 +13,9 @@ type EventDetails = {
   clickStrategy?: string;
   valueBefore?: string;
   valueAfter?: string;
+  totalInputs?: number;
+  validInputs?: Array<Record<string, unknown>>;
+  finalInputChosen?: string;
   attemptedSelectors?: string[];
   failedSelectors?: string[];
   detectedInputs?: Array<{
@@ -840,6 +843,15 @@ export function PilotRunner() {
                 ) : null}
                 {typeof event.details?.valueAfter === "string" ? (
                   <span className="timeline-step">Valor confirmado: {event.details.valueAfter}</span>
+                ) : null}
+                {typeof event.details?.totalInputs === "number" ? (
+                  <span className="timeline-step">Total inputs: {event.details.totalInputs}</span>
+                ) : null}
+                {Array.isArray(event.details?.validInputs) ? (
+                  <span className="timeline-step">Inputs válidos: {event.details.validInputs.length}</span>
+                ) : null}
+                {typeof event.details?.finalInputChosen === "string" ? (
+                  <span className="timeline-step">Input final: {event.details.finalInputChosen}</span>
                 ) : null}
               </article>
             ))

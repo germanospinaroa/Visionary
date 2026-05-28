@@ -79,6 +79,15 @@ type ScreenDiagnostics = {
   buttons: ScreenButtonDiagnostic[];
 };
 
+type InputCandidate = ScreenInputDiagnostic & {
+  index: number;
+  selector: string;
+  readonly: boolean;
+  opacity: string;
+  formId: string;
+  surroundingText: string;
+};
+
 type ExtractedOption = {
   text: string;
   locator: Locator;
@@ -243,43 +252,72 @@ async function collectScreenDiagnostics(page: Page): Promise<ScreenDiagnostics> 
     .evaluate((element) => (element instanceof HTMLElement ? element.outerHTML.slice(0, 50_000) : ""))
     .catch(() => "");
 
-  const inputs = await page.locator("input, textarea, select").evaluateAll((elements) => {
-    return elements.map((element) => {
-      const input = element as HTMLInputElement | HTMLTextAreaElement | HTMLSelectElement;
-      const rect = element.getBoundingClientRect();
-      const style = window.getComputedStyle(element);
-      return {
-        tag: element.tagName.toLowerCase(),
-        type: "type" in input ? input.type ?? "" : "",
-        name: input.getAttribute("name") ?? "",
-        id: input.id ?? "",
-        placeholder: input.getAttribute("placeholder") ?? "",
-        visible: rect.width > 0 && rect.height > 0 && style.visibility !== "hidden" && style.display !== "none",
-        disabled: "disabled" in input ? Boolean(input.disabled) : false
-      };
-    });
-  });
+  const inputs: ScreenInputDiagnostic[] = [];
+  const inputLocator = page.locator("input, textarea, select");
+  const inputCount = await inputLocator.count();
 
-  const buttons = await page
-    .locator('button, input[type="submit"], input[type="button"]')
-    .evaluateAll((elements) => {
-      return elements.map((element) => {
-        const control = element as HTMLButtonElement | HTMLInputElement;
-        const text = element instanceof HTMLButtonElement ? element.innerText.trim() : "";
+  for (let index = 0; index < inputCount; index += 1) {
+    const input = await inputLocator
+      .nth(index)
+      .evaluate((element) => {
+        const control = element as HTMLInputElement | HTMLTextAreaElement | HTMLSelectElement;
         const rect = element.getBoundingClientRect();
         const style = window.getComputedStyle(element);
         return {
           tag: element.tagName.toLowerCase(),
-          text,
+          type: "type" in control ? control.type ?? "" : "",
+          name: control.getAttribute("name") ?? "",
+          id: control.id ?? "",
+          placeholder: control.getAttribute("placeholder") ?? "",
+          visible:
+            rect.width > 0 &&
+            rect.height > 0 &&
+            style.visibility !== "hidden" &&
+            style.display !== "none" &&
+            style.opacity !== "0",
+          disabled: "disabled" in control ? Boolean(control.disabled) : false
+        };
+      })
+      .catch(() => null);
+
+    if (input) {
+      inputs.push(input);
+    }
+  }
+
+  const buttons: ScreenButtonDiagnostic[] = [];
+  const buttonLocator = page.locator('button, input[type="submit"], input[type="button"]');
+  const buttonCount = await buttonLocator.count();
+
+  for (let index = 0; index < buttonCount; index += 1) {
+    const button = await buttonLocator
+      .nth(index)
+      .evaluate((element) => {
+        const control = element as HTMLButtonElement | HTMLInputElement;
+        const rect = element.getBoundingClientRect();
+        const style = window.getComputedStyle(element);
+        return {
+          tag: element.tagName.toLowerCase(),
+          text: element instanceof HTMLButtonElement ? element.innerText.trim() : "",
           type: "type" in control ? control.type ?? "" : "",
           name: control.getAttribute("name") ?? "",
           id: control.id ?? "",
           value: "value" in control ? control.value ?? "" : "",
-          visible: rect.width > 0 && rect.height > 0 && style.visibility !== "hidden" && style.display !== "none",
+          visible:
+            rect.width > 0 &&
+            rect.height > 0 &&
+            style.visibility !== "hidden" &&
+            style.display !== "none" &&
+            style.opacity !== "0",
           disabled: "disabled" in control ? Boolean(control.disabled) : false
         };
-      });
-    });
+      })
+      .catch(() => null);
+
+    if (button) {
+      buttons.push(button);
+    }
+  }
 
   return {
     url,
@@ -375,21 +413,8 @@ async function recordScreenDiagnostics({
   };
 }
 
-function getStoreInputFallbacks() {
-  return [
-    { selector: "input:visible", label: "visible_input" },
-    { selector: 'input[type="text"]:visible', label: "text_input" },
-    { selector: 'input:not([disabled]):visible', label: "first_enabled_input" },
-    { selector: 'label:has-text("Código") input', label: "input_near_codigo_label" },
-    { selector: 'label:has-text("Codigo") input', label: "input_near_codigo_label_ascii" },
-    {
-      selector:
-        'xpath=(//*[contains(translate(normalize-space(.), "ÁÉÍÓÚABCDEFGHIJKLMNOPQRSTUVWXYZ", "aeiouabcdefghijklmnopqrstuvwxyz"), "codigo")])[1]/following::input[not(@disabled)][1]',
-      label: "input_near_codigo_text"
-    },
-    { selector: 'input[placeholder*="código" i]:visible', label: "codigo_placeholder" },
-    { selector: 'input[placeholder*="codigo" i]:visible', label: "codigo_placeholder_ascii" }
-  ];
+function getStoreInputKeywords() {
+  return ["codigo", "código", "store", "tienda"];
 }
 
 function getEntryButtonFallbacks() {
@@ -402,8 +427,123 @@ function getEntryButtonFallbacks() {
   ];
 }
 
-async function resolveStoreCodeInput(page: Page, selectors: SurveySelectorConfig) {
-  return resolveTarget(page, selectors.storeCodeInputSelectors, getStoreInputFallbacks());
+async function collectInputCandidates(page: Page): Promise<{
+  totalInputs: number;
+  validCandidates: InputCandidate[];
+}> {
+  const locator = page.locator("input, textarea, select");
+  const totalInputs = await locator.count();
+  const validCandidates: InputCandidate[] = [];
+
+  for (let index = 0; index < totalInputs; index += 1) {
+    const candidate = await locator
+      .nth(index)
+      .evaluate((element, elementIndex) => {
+        const control = element as HTMLInputElement | HTMLTextAreaElement | HTMLSelectElement;
+        const rect = element.getBoundingClientRect();
+        const style = window.getComputedStyle(element);
+        const type = "type" in control ? control.type ?? "" : "";
+        const parentForm = element.closest("form");
+        const label = element.id ? document.querySelector(`label[for="${element.id}"]`) : null;
+        const surroundingText = (
+          label?.textContent ||
+          parentForm?.textContent ||
+          element.parentElement?.textContent ||
+          ""
+        )
+          .replace(/\s+/g, " ")
+          .trim()
+          .slice(0, 400);
+
+        return {
+          index: elementIndex as number,
+          selector: `input, textarea, select >> nth=${elementIndex as number}`,
+          tag: element.tagName.toLowerCase(),
+          type,
+          name: control.getAttribute("name") ?? "",
+          id: control.id ?? "",
+          placeholder: control.getAttribute("placeholder") ?? "",
+          visible:
+            rect.width > 0 &&
+            rect.height > 0 &&
+            style.visibility !== "hidden" &&
+            style.display !== "none" &&
+            style.opacity !== "0",
+          disabled: "disabled" in control ? Boolean(control.disabled) : false,
+          readonly: "readOnly" in control ? Boolean(control.readOnly) : false,
+          opacity: style.opacity,
+          formId: parentForm?.id ?? "",
+          surroundingText
+        };
+      }, index)
+      .catch(() => null);
+
+    if (!candidate) {
+      continue;
+    }
+
+    const disallowedType = ["hidden", "submit", "button", "checkbox", "radio", "file", "image"].includes(
+      candidate.type.toLowerCase()
+    );
+
+    if (!candidate.visible || candidate.disabled || candidate.readonly || disallowedType) {
+      continue;
+    }
+
+    validCandidates.push(candidate);
+  }
+
+  return {
+    totalInputs,
+    validCandidates
+  };
+}
+
+async function resolveStoreCodeInput(page: Page, _selectors: SurveySelectorConfig) {
+  const { totalInputs, validCandidates } = await collectInputCandidates(page);
+  const keywords = getStoreInputKeywords();
+  const keywordMatch = validCandidates.find((candidate) => {
+    const haystack = `${candidate.name} ${candidate.id} ${candidate.placeholder} ${candidate.surroundingText}`.toLowerCase();
+    return keywords.some((keyword) => haystack.includes(keyword));
+  });
+
+  const textTypeMatch = validCandidates.find((candidate) => candidate.type.toLowerCase() === "text");
+  const formMatch = validCandidates.find((candidate) => candidate.formId);
+  const fallbackMatch = validCandidates[0];
+  const finalCandidate = keywordMatch ?? textTypeMatch ?? formMatch ?? fallbackMatch ?? null;
+
+  if (!finalCandidate) {
+    return null;
+  }
+
+  return {
+    locator: page.locator("input, textarea, select").nth(finalCandidate.index),
+    selector: finalCandidate.selector,
+    strategy: keywordMatch ? "configured" : "fallback",
+    fallbackLabel: keywordMatch
+      ? undefined
+      : textTypeMatch
+        ? "visible_text_input"
+        : formMatch
+          ? "first_input_in_main_form"
+          : "first_valid_visible_input",
+    attemptedSelectors: validCandidates.map((candidate) => candidate.selector),
+    failedSelectors: [],
+    totalInputs,
+    validInputs: validCandidates.map((candidate) => ({
+      index: candidate.index,
+      selector: candidate.selector,
+      tag: candidate.tag,
+      type: candidate.type,
+      name: candidate.name,
+      id: candidate.id,
+      placeholder: candidate.placeholder,
+      formId: candidate.formId
+    }))
+  } as SelectorResolution & {
+    totalInputs: number;
+    validInputs: Array<Record<string, unknown>>;
+  };
 }
 
 async function resolveEntryButton(page: Page, selectors: SurveySelectorConfig) {
@@ -1264,10 +1404,7 @@ export async function runPilotSurvey(runId: string) {
         name: "initial-screen-store-input-missing",
         message: "No se encontró un campo válido para store code.",
         metadata: {
-          attemptedSelectors: [
-            ...browserConfig.selectors.storeCodeInputSelectors,
-            ...getStoreInputFallbacks().map((fallback) => fallback.selector)
-          ]
+          attemptedSelectors: browserConfig.selectors.storeCodeInputSelectors
         }
       });
       throw new PilotFlowError(
@@ -1303,7 +1440,16 @@ export async function runPilotSurvey(runId: string) {
         resolutionStrategy: storeCodeMatch.strategy,
         fallbackUsed: storeCodeMatch.fallbackLabel ?? null,
         attemptedSelectors: storeCodeMatch.attemptedSelectors,
-        failedSelectors: storeCodeMatch.failedSelectors
+        failedSelectors: storeCodeMatch.failedSelectors,
+        totalInputs:
+          "totalInputs" in storeCodeMatch && typeof storeCodeMatch.totalInputs === "number"
+            ? storeCodeMatch.totalInputs
+            : null,
+        validInputs:
+          "validInputs" in storeCodeMatch && Array.isArray(storeCodeMatch.validInputs)
+            ? storeCodeMatch.validInputs
+            : [],
+        finalInputChosen: storeCodeMatch.selector
       }
     });
 
@@ -1353,7 +1499,15 @@ export async function runPilotSurvey(runId: string) {
           fallbackUsed: storeCodeMatch.fallbackLabel ?? null,
           fillMethod: fillResult.method,
           valueBefore: fillResult.valueBefore,
-          valueAfter: fillResult.valueAfter
+          valueAfter: fillResult.valueAfter,
+          totalInputs:
+            "totalInputs" in storeCodeMatch && typeof storeCodeMatch.totalInputs === "number"
+              ? storeCodeMatch.totalInputs
+              : null,
+          validInputs:
+            "validInputs" in storeCodeMatch && Array.isArray(storeCodeMatch.validInputs)
+              ? storeCodeMatch.validInputs
+              : []
         }
       });
       await emitWorkerEvent({
@@ -1368,7 +1522,16 @@ export async function runPilotSurvey(runId: string) {
           fallbackUsed: storeCodeMatch.fallbackLabel ?? null,
           fillMethod: fillResult.method,
           valueBefore: fillResult.valueBefore,
-          valueAfter: fillResult.valueAfter
+          valueAfter: fillResult.valueAfter,
+          totalInputs:
+            "totalInputs" in storeCodeMatch && typeof storeCodeMatch.totalInputs === "number"
+              ? storeCodeMatch.totalInputs
+              : null,
+          validInputs:
+            "validInputs" in storeCodeMatch && Array.isArray(storeCodeMatch.validInputs)
+              ? storeCodeMatch.validInputs
+              : [],
+          finalInputChosen: storeCodeMatch.selector
         }
       });
     } catch {
