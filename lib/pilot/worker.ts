@@ -234,21 +234,17 @@ async function collectScreenDiagnostics(page: Page): Promise<ScreenDiagnostics> 
     .catch(() => "");
 
   const inputs = await page.locator("input, textarea, select").evaluateAll((elements) => {
-    const isVisible = (element: Element) => {
-      const rect = element.getBoundingClientRect();
-      const style = window.getComputedStyle(element);
-      return rect.width > 0 && rect.height > 0 && style.visibility !== "hidden" && style.display !== "none";
-    };
-
     return elements.map((element) => {
       const input = element as HTMLInputElement | HTMLTextAreaElement | HTMLSelectElement;
+      const rect = element.getBoundingClientRect();
+      const style = window.getComputedStyle(element);
       return {
         tag: element.tagName.toLowerCase(),
         type: "type" in input ? input.type ?? "" : "",
         name: input.getAttribute("name") ?? "",
         id: input.id ?? "",
         placeholder: input.getAttribute("placeholder") ?? "",
-        visible: isVisible(element),
+        visible: rect.width > 0 && rect.height > 0 && style.visibility !== "hidden" && style.display !== "none",
         disabled: "disabled" in input ? Boolean(input.disabled) : false
       };
     });
@@ -257,15 +253,11 @@ async function collectScreenDiagnostics(page: Page): Promise<ScreenDiagnostics> 
   const buttons = await page
     .locator('button, input[type="submit"], input[type="button"]')
     .evaluateAll((elements) => {
-      const isVisible = (element: Element) => {
-        const rect = element.getBoundingClientRect();
-        const style = window.getComputedStyle(element);
-        return rect.width > 0 && rect.height > 0 && style.visibility !== "hidden" && style.display !== "none";
-      };
-
       return elements.map((element) => {
         const control = element as HTMLButtonElement | HTMLInputElement;
         const text = element instanceof HTMLButtonElement ? element.innerText.trim() : "";
+        const rect = element.getBoundingClientRect();
+        const style = window.getComputedStyle(element);
         return {
           tag: element.tagName.toLowerCase(),
           text,
@@ -273,7 +265,7 @@ async function collectScreenDiagnostics(page: Page): Promise<ScreenDiagnostics> 
           name: control.getAttribute("name") ?? "",
           id: control.id ?? "",
           value: "value" in control ? control.value ?? "" : "",
-          visible: isVisible(element),
+          visible: rect.width > 0 && rect.height > 0 && style.visibility !== "hidden" && style.display !== "none",
           disabled: "disabled" in control ? Boolean(control.disabled) : false
         };
       });
@@ -510,21 +502,26 @@ async function extractImageLinks(page: Page, selectors: SurveySelectorConfig) {
   const matchedImageSelectors = new Set<string>();
 
   for (const selector of selectors.imageSelectors) {
-    const handles = await page.locator(selector).evaluateAll((elements) =>
-      elements
-        .map((element) => {
-          if (element instanceof HTMLImageElement) {
-            return element.currentSrc || element.src;
+    const handles = await page.locator(selector).evaluateAll((elements) => {
+      return elements.reduce<string[]>((collected, element) => {
+        if (element instanceof HTMLImageElement) {
+          const source = element.currentSrc || element.src;
+          if (source) {
+            collected.push(source);
           }
+          return collected;
+        }
 
-          if (element instanceof HTMLAnchorElement) {
-            return element.href;
+        if (element instanceof HTMLAnchorElement) {
+          if (element.href) {
+            collected.push(element.href);
           }
+          return collected;
+        }
 
-          return null;
-        })
-        .filter(Boolean)
-    );
+        return collected;
+      }, []);
+    });
 
     for (const handle of handles) {
       if (typeof handle === "string" && handle.startsWith("http")) {
@@ -2236,6 +2233,7 @@ export async function diagnosePilotRunScreen(runId: string) {
     });
 
     return {
+      ok: true,
       detectedScreen: screen.kind,
       screenshotPath: diagnostic.screenshot.storagePath,
       screenshotBucket: STORAGE_BUCKETS.analysisArtifacts,
@@ -2243,6 +2241,49 @@ export async function diagnosePilotRunScreen(runId: string) {
       htmlArtifactPath: diagnostic.htmlArtifact.path,
       inputs: diagnostic.diagnostics.inputs,
       buttons: diagnostic.diagnostics.buttons
+    };
+  } catch (error) {
+    const title = await page.title().catch(() => "");
+    const url = page.url();
+    const screenshot = await captureAndUploadScreenshot({
+      page,
+      runId,
+      fileName: `diagnostic-error-${Date.now()}.png`,
+      bucket: STORAGE_BUCKETS.analysisArtifacts
+    }).catch(() => null);
+
+    if (screenshot) {
+      await setCurrentBrowserScreenshot({
+        runId,
+        bucket: STORAGE_BUCKETS.analysisArtifacts,
+        storagePath: screenshot.storagePath
+      }).catch(() => null);
+    }
+
+    await emitWorkerEvent({
+      runId,
+      level: "error",
+      eventType: "screen_diagnosis_failed",
+      step: "diagnostics",
+      message: error instanceof Error ? error.message : "Diagnóstico de pantalla falló.",
+      metadata: {
+        url,
+        title,
+        screenshotPath: screenshot?.storagePath ?? null
+      },
+      screenshotBucket: screenshot ? STORAGE_BUCKETS.analysisArtifacts : undefined,
+      screenshotPath: screenshot?.storagePath
+    }).catch(() => null);
+
+    return {
+      ok: false,
+      error: "diagnostic_failed",
+      detail: error instanceof Error ? error.message : "Diagnóstico de pantalla falló.",
+      partial: {
+        screenshot: screenshot?.storagePath ?? null,
+        url,
+        title
+      }
     };
   } finally {
     await browser.close();

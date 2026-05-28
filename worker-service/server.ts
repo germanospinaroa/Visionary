@@ -314,16 +314,21 @@ async function handleDiagnoseRun(runId: string, response: ServerResponse) {
   log("info", "Pilot screen diagnosed.", { runId });
 
   const payload = {
-    ok: true,
     runId,
     diagnostic
   };
-  writeJson(response, 200, payload);
+  writeJson(response, 200, {
+    ok: diagnostic && typeof diagnostic === "object" && "ok" in diagnostic ? Boolean(diagnostic.ok) : true,
+    ...payload
+  });
   log("info", "Request completed.", {
     method: "POST",
     path: `/runs/${runId}/diagnose`,
     status: 200,
-    body: payload
+    body: {
+      ok: diagnostic && typeof diagnostic === "object" && "ok" in diagnostic ? Boolean(diagnostic.ok) : true,
+      ...payload
+    }
   });
 }
 

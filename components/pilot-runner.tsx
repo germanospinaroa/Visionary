@@ -527,6 +527,20 @@ export function PilotRunner() {
         throw new Error(payload.detail ?? payload.error ?? payload.message ?? "No se pudo ejecutar el diagnóstico.");
       }
 
+      if (payload.ok === false) {
+        const partial =
+          payload.diagnostic && typeof payload.diagnostic === "object" && "partial" in payload.diagnostic
+            ? payload.diagnostic.partial
+            : null;
+        const partialSummary =
+          partial && typeof partial === "object"
+            ? ` URL: ${String((partial as Record<string, unknown>).url ?? "n/a")}.`
+            : "";
+        throw new Error(
+          `${payload.detail ?? payload.error ?? "El diagnóstico remoto falló dentro del worker."}${partialSummary}`
+        );
+      }
+
       setStatusNotice(
         payload.diagnostic
           ? "Diagnóstico ejecutado. Revisa inputs, botones y captura en el panel."

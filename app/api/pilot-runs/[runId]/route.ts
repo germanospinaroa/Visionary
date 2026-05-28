@@ -80,6 +80,18 @@ export async function POST(request: Request, context: { params: Promise<{ runId:
 
     const diagnostic = await diagnoseRemotePilotRun(runId);
 
+    if (diagnostic && typeof diagnostic === "object" && diagnostic.ok === false) {
+      return NextResponse.json({
+        ok: false,
+        error: typeof diagnostic.error === "string" ? diagnostic.error : "diagnostic_failed",
+        detail:
+          typeof diagnostic.detail === "string"
+            ? diagnostic.detail
+            : "El diagnóstico remoto falló dentro del worker.",
+        diagnostic
+      });
+    }
+
     await updateSurveyRun(runId, {
       current_step: "diagnostics"
     });
