@@ -6,11 +6,15 @@ export type PilotRunStatus =
   | "selecting_used_images"
   | "completed"
   | "failed"
-  | "paused";
+  | "paused"
+  | "needs_selector_calibration"
+  | "human_review";
 
 export type SurveySelectorConfig = {
   storeCodeInputSelectors: string[];
   validatorCodeInputSelectors: string[];
+  entryButtonSelectors: string[];
+  startSurveyButtonSelectors: string[];
   nextButtonSelectors: string[];
   imageSelectors: string[];
   usedImageCheckboxSelectors: string[];

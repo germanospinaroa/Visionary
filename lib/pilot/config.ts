@@ -18,6 +18,23 @@ export const DEFAULT_SELECTORS: SurveySelectorConfig = {
     'input[type="password"]',
     'input[type="text"]'
   ],
+  entryButtonSelectors: [
+    'button:has-text("Entrar")',
+    'button:has-text("Ingresar")',
+    'button:has-text("Acceder")',
+    'button:has-text("Continuar")',
+    'button[type="submit"]',
+    'input[type="submit"]'
+  ],
+  startSurveyButtonSelectors: [
+    'button:has-text("Iniciar encuesta")',
+    'button:has-text("Iniciar")',
+    'button:has-text("Comenzar")',
+    'button:has-text("Empezar")',
+    'button:has-text("Start survey")',
+    'button[type="submit"]',
+    'input[type="submit"]'
+  ],
   nextButtonSelectors: [
     'button:has-text("Siguiente")',
     'button:has-text("Continuar")',

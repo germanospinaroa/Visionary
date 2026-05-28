@@ -41,6 +41,16 @@ type ExtractedOption = {
 
 type ScreenState =
   | {
+      kind: "initial";
+      imageLinks: string[];
+      matchedImageSelectors: string[];
+    }
+  | {
+      kind: "validator";
+      imageLinks: string[];
+      matchedImageSelectors: string[];
+    }
+  | {
       kind: "images";
       imageLinks: string[];
       matchedImageSelectors: string[];
@@ -275,6 +285,26 @@ async function assertFieldValue({
 
 async function classifyScreen(page: Page, selectors: SurveySelectorConfig): Promise<ScreenState> {
   const { urls, matchedImageSelectors } = await extractImageLinks(page, selectors);
+  const hasStoreInput = Boolean(await firstVisible(page, selectors.storeCodeInputSelectors));
+  const hasValidatorInput = Boolean(await firstVisible(page, selectors.validatorCodeInputSelectors));
+  const hasEntryButton = Boolean(await firstVisible(page, selectors.entryButtonSelectors));
+  const hasStartSurveyButton = Boolean(await firstVisible(page, selectors.startSurveyButtonSelectors));
+
+  if (hasStoreInput && hasEntryButton && !urls.length && !hasStartSurveyButton) {
+    return {
+      kind: "initial",
+      imageLinks: urls,
+      matchedImageSelectors
+    };
+  }
+
+  if (hasValidatorInput && (urls.length > 0 || hasStartSurveyButton)) {
+    return {
+      kind: "validator",
+      imageLinks: urls,
+      matchedImageSelectors
+    };
+  }
 
   if (await pageLooksLikeUsedImages(page)) {
     return {
@@ -710,7 +740,7 @@ export async function runPilotSurvey(runId: string) {
   try {
     await updateSurveyRun(runId, {
       status: "running",
-      current_step: "opening_survey",
+      current_step: "initial_screen",
       browser_session_id: browserSessionId,
       started_at: new Date().toISOString()
     });
@@ -734,7 +764,7 @@ export async function runPilotSurvey(runId: string) {
       runId,
       eventType: "opening_survey",
       step: "opening_survey",
-      message: "Abriendo URL de encuesta.",
+      message: "Abriendo pantalla inicial.",
       metadata: {
         surveyUrl
       }
@@ -767,6 +797,24 @@ export async function runPilotSurvey(runId: string) {
       }
     });
 
+    const initialScreen = await waitForExpectedScreen({
+      page,
+      selectors: browserConfig.selectors,
+      expectedKinds: ["initial"],
+      timeoutMs: 10_000,
+      failureStep: "initial_screen",
+      failureMessage: "No se detectó la pantalla inicial esperada. Se requiere calibración."
+    });
+    await emitWorkerEvent({
+      runId,
+      eventType: "screen_detected",
+      step: "initial_screen",
+      message: "Pantalla detectada.",
+      metadata: {
+        screen: initialScreen.kind
+      }
+    });
+
     const storeCode =
       run.stores && typeof run.stores === "object" && "store_code" in run.stores
         ? String(run.stores.store_code ?? "")
@@ -775,7 +823,7 @@ export async function runPilotSurvey(runId: string) {
     await emitWorkerEvent({
       runId,
       eventType: "filling_store_code",
-      step: "opening_survey",
+      step: "initial_screen",
       message: "Completando store code.",
       metadata: {
         storeCode
@@ -784,7 +832,7 @@ export async function runPilotSurvey(runId: string) {
     await captureActionScreenshot({
       page,
       runId,
-      step: "opening_survey",
+      step: "initial_screen",
       action: "before-fill-store-code",
       message: "Antes de llenar store code.",
       metadata: {
@@ -796,12 +844,12 @@ export async function runPilotSurvey(runId: string) {
       locator: storeCodeMatch.locator,
       expectedValue: storeCode,
       fieldName: "store code",
-      step: "opening_survey"
+      step: "initial_screen"
     });
     await captureActionScreenshot({
       page,
       runId,
-      step: "opening_survey",
+      step: "initial_screen",
       action: "after-fill-store-code",
       message: "Store code visible en el formulario.",
       metadata: {
@@ -812,7 +860,7 @@ export async function runPilotSurvey(runId: string) {
     await emitWorkerEvent({
       runId,
       eventType: "store_code_filled",
-      step: "opening_survey",
+      step: "initial_screen",
       message: "Campo store code llenado.",
       metadata: {
         storeCode,
@@ -822,8 +870,70 @@ export async function runPilotSurvey(runId: string) {
 
     await emitWorkerEvent({
       runId,
+      eventType: "clicking_next",
+      step: "initial_screen",
+      message: "Preparando clic en Entrar.",
+      metadata: {
+        context: "entry_screen"
+      }
+    });
+    await captureActionScreenshot({
+      page,
+      runId,
+      step: "initial_screen",
+      action: "before-click-entry",
+      message: "Antes de hacer clic en Entrar."
+    });
+    const entryButtonMatch = await clickNext(page, browserConfig.selectors.entryButtonSelectors);
+    const validatorScreen = await waitForExpectedScreen({
+      page,
+      selectors: browserConfig.selectors,
+      expectedKinds: ["validator"],
+      timeoutMs: 12_000,
+      failureStep: "validator_screen",
+      failureMessage:
+        "No se detectó la segunda pantalla después de Entrar. Se requiere calibración."
+    });
+    await captureActionScreenshot({
+      page,
+      runId,
+      step: "validator_screen",
+      action: "after-click-entry",
+      message: "Segunda pantalla detectada.",
+      metadata: {
+        detectedScreen: validatorScreen.kind
+      }
+    });
+    await emitWorkerEvent({
+      runId,
+      eventType: "next_clicked",
+      step: "initial_screen",
+      message: "Clic en Entrar.",
+      metadata: {
+        context: "entry_screen",
+        selectorUsed: entryButtonMatch.selector
+      }
+    });
+    await emitWorkerEvent({
+      runId,
+      eventType: "screen_detected",
+      step: "validator_screen",
+      message: "Segunda pantalla detectada.",
+      metadata: {
+        screen: validatorScreen.kind
+      }
+    });
+
+    await updateSurveyRun(runId, {
+      status: "extracting_images",
+      current_step: "validator_screen",
+      current_question_text: null
+    });
+
+    await emitWorkerEvent({
+      runId,
       eventType: "filling_validator_code",
-      step: "opening_survey",
+      step: "validator_screen",
       message: "Completando validator code.",
       metadata: {
         validatorCodeLength: validatorCode.length
@@ -832,7 +942,7 @@ export async function runPilotSurvey(runId: string) {
     await captureActionScreenshot({
       page,
       runId,
-      step: "opening_survey",
+      step: "validator_screen",
       action: "before-fill-validator-code",
       message: "Antes de llenar validator code."
     });
@@ -845,14 +955,14 @@ export async function runPilotSurvey(runId: string) {
       locator: validatorCodeMatch.locator,
       expectedValue: validatorCode,
       fieldName: "validator code",
-      step: "opening_survey"
+      step: "validator_screen"
     });
     await captureActionScreenshot({
       page,
       runId,
-      step: "opening_survey",
+      step: "validator_screen",
       action: "after-fill-validator-code",
-      message: "Validator code visible en el formulario.",
+      message: "Validator code visible en la segunda pantalla.",
       metadata: {
         selectorUsed: validatorCodeMatch.selector
       }
@@ -860,7 +970,7 @@ export async function runPilotSurvey(runId: string) {
     await emitWorkerEvent({
       runId,
       eventType: "validator_code_filled",
-      step: "opening_survey",
+      step: "validator_screen",
       message: "Campo validator code llenado.",
       metadata: {
         validatorCodeLength: validatorCode.length,
@@ -868,86 +978,11 @@ export async function runPilotSurvey(runId: string) {
       }
     });
 
-    await emitWorkerEvent({
-      runId,
-      eventType: "clicking_next",
-      step: "opening_survey",
-      message: "Ejecutando click en siguiente.",
-      metadata: {
-        context: "open_survey"
-      }
-    });
+    const imageLinks = validatorScreen.imageLinks;
     await captureActionScreenshot({
       page,
       runId,
-      step: "opening_survey",
-      action: "before-click-next-open-survey",
-      message: "Antes de hacer clic en siguiente para abrir la encuesta."
-    });
-    const nextMatch = await clickNext(page, browserConfig.selectors.nextButtonSelectors);
-    const surveyEntryScreen = await waitForExpectedScreen({
-      page,
-      selectors: browserConfig.selectors,
-      expectedKinds: ["images", "question", "used_images", "completion"],
-      timeoutMs: 12_000,
-      failureStep: "opening_survey",
-      failureMessage:
-        "No se pudo detectar la pantalla posterior al clic en siguiente. Se requiere calibración de selectores."
-    });
-    await captureActionScreenshot({
-      page,
-      runId,
-      step: "opening_survey",
-      action: "after-click-next-open-survey",
-      message: "Pantalla posterior al clic en siguiente.",
-      metadata: {
-        detectedScreen: surveyEntryScreen.kind
-      }
-    });
-    await emitWorkerEvent({
-      runId,
-      eventType: "next_clicked",
-      step: "opening_survey",
-      message: "Clic en siguiente.",
-      metadata: {
-        context: "open_survey",
-        selectorUsed: nextMatch.selector
-      }
-    });
-    await emitWorkerEvent({
-      runId,
-      eventType: "screen_detected",
-      step: "opening_survey",
-      message: "Pantalla detectada.",
-      metadata: {
-        screen: surveyEntryScreen.kind
-      }
-    });
-
-    await updateSurveyRun(runId, {
-      status: "extracting_images",
-      current_step: "extracting_images",
-      current_question_text: null
-    });
-
-    const imageScreen =
-      surveyEntryScreen.kind === "images"
-        ? surveyEntryScreen
-        : await waitForExpectedScreen({
-            page,
-            selectors: browserConfig.selectors,
-            expectedKinds: ["images", "question", "used_images", "completion"],
-            timeoutMs: 4_000,
-            failureStep: "extracting_images",
-            failureMessage:
-              "No se pudo clasificar la pantalla posterior a la apertura de la encuesta. Se requiere calibración."
-          });
-
-    const imageLinks = imageScreen.imageLinks;
-    await captureActionScreenshot({
-      page,
-      runId,
-      step: "extracting_images",
+      step: "validator_screen",
       action: "image-links-visible",
       message: "Captura cuando aparecen los links de imágenes.",
       metadata: {
@@ -957,12 +992,12 @@ export async function runPilotSurvey(runId: string) {
     await emitWorkerEvent({
       runId,
       eventType: "image_links_detected",
-      step: "extracting_images",
-      message: "Links de imágenes detectados.",
+      step: "validator_screen",
+      message: "Imágenes detectadas.",
       metadata: {
         count: imageLinks.length,
         urls: imageLinks,
-        selectorsUsed: imageScreen.matchedImageSelectors
+        selectorsUsed: validatorScreen.matchedImageSelectors
       }
     });
 
@@ -973,7 +1008,7 @@ export async function runPilotSurvey(runId: string) {
         await emitWorkerEvent({
           runId,
           eventType: "image_download_started",
-          step: "extracting_images",
+          step: "validator_screen",
           message: `Descarga iniciada para imagen ${index + 1}.`,
           metadata: {
             imageIndex: index + 1,
@@ -986,7 +1021,7 @@ export async function runPilotSurvey(runId: string) {
         await emitWorkerEvent({
           runId,
           eventType: "image_download_completed",
-          step: "extracting_images",
+          step: "validator_screen",
           message: `Descarga completada para imagen ${index + 1}.`,
           metadata: {
             imageIndex: index + 1,
@@ -1000,7 +1035,7 @@ export async function runPilotSurvey(runId: string) {
           runId,
           level: "warn",
           eventType: "image_extract_failed",
-          step: "extracting_images",
+          step: "validator_screen",
           message: imageError instanceof Error ? imageError.message : "Error descargando imagen.",
           metadata: {
             sourceUrl
@@ -1012,7 +1047,7 @@ export async function runPilotSurvey(runId: string) {
     await emitWorkerEvent({
       runId,
       eventType: "images_uploaded",
-      step: "extracting_images",
+      step: "validator_screen",
       message: "Imágenes persistidas en storage.",
       metadata: {
         count: extractedImages.length,
@@ -1023,56 +1058,56 @@ export async function runPilotSurvey(runId: string) {
     await emitWorkerEvent({
       runId,
       eventType: "clicking_next",
-      step: "extracting_images",
-      message: "Ejecutando click en siguiente tras extraer imágenes.",
+      step: "validator_screen",
+      message: "Preparando clic en Iniciar encuesta.",
       metadata: {
-        context: "after_image_extraction"
+        context: "start_survey"
       }
     });
     await captureActionScreenshot({
       page,
       runId,
-      step: "extracting_images",
-      action: "before-click-next-after-images",
-      message: "Antes de avanzar después de detectar imágenes."
+      step: "validator_screen",
+      action: "before-click-start-survey",
+      message: "Antes de hacer clic en Iniciar encuesta."
     });
-    const afterImagesNextMatch = await clickNext(page, browserConfig.selectors.nextButtonSelectors);
-    const postImageScreen = await waitForExpectedScreen({
+    const startSurveyMatch = await clickNext(page, browserConfig.selectors.startSurveyButtonSelectors);
+    const firstQuestionScreen = await waitForExpectedScreen({
       page,
       selectors: browserConfig.selectors,
-      expectedKinds: ["question", "used_images", "completion"],
+      expectedKinds: ["question"],
       timeoutMs: 12_000,
-      failureStep: "extracting_images",
+      failureStep: "question_boot",
       failureMessage:
-        "No se detectó una pantalla válida después de extraer imágenes. Se requiere calibración del survey."
+        "No se detectó la primera pregunta después de iniciar la encuesta. Se requiere calibración."
     });
     await captureActionScreenshot({
       page,
       runId,
-      step: "extracting_images",
-      action: "after-click-next-after-images",
-      message: "Pantalla posterior a la extracción de imágenes.",
+      step: "question_boot",
+      action: "after-click-start-survey",
+      message: "Primera pregunta detectada.",
       metadata: {
-        detectedScreen: postImageScreen.kind
+        detectedScreen: firstQuestionScreen.kind
       }
     });
     await emitWorkerEvent({
       runId,
       eventType: "next_clicked",
-      step: "extracting_images",
-      message: "Clic en siguiente.",
+      step: "validator_screen",
+      message: "Clic en Iniciar encuesta.",
       metadata: {
-        context: "after_image_extraction",
-        selectorUsed: afterImagesNextMatch.selector
+        context: "start_survey",
+        selectorUsed: startSurveyMatch.selector
       }
     });
     await emitWorkerEvent({
       runId,
       eventType: "screen_detected",
-      step: "extracting_images",
-      message: "Pantalla detectada.",
+      step: "question_boot",
+      message: "Primera pregunta detectada.",
       metadata: {
-        screen: postImageScreen.kind
+        screen: firstQuestionScreen.kind
       }
     });
 

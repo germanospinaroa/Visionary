@@ -87,7 +87,7 @@ textarea {
 .pilot-main-layout {
   display: grid;
   gap: 24px;
-  grid-template-columns: minmax(280px, 320px) minmax(0, 1fr);
+  grid-template-columns: minmax(260px, 300px) minmax(0, 1fr);
   align-items: start;
 }
 
@@ -273,7 +273,7 @@ textarea {
   display: grid;
   gap: 16px;
   align-content: start;
-  min-height: 640px;
+  min-height: 700px;
   background:
     linear-gradient(180deg, rgba(255, 252, 247, 0.96), rgba(245, 237, 226, 0.9)),
     var(--panel);
@@ -366,8 +366,8 @@ textarea {
 }
 
 .browser-stage {
-  min-height: 620px;
-  max-height: 860px;
+  min-height: 680px;
+  max-height: 960px;
   display: grid;
   place-items: start center;
   padding: 8px;

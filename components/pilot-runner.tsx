@@ -119,6 +119,18 @@ function getOperationalStep(step: string | null, questionIndex: number | null) {
     return "Abriendo encuesta";
   }
 
+  if (step === "initial_screen") {
+    return "Ingresando código de tienda";
+  }
+
+  if (step === "validator_screen") {
+    return "Validando código e imágenes";
+  }
+
+  if (step === "question_boot") {
+    return "Abriendo primera pregunta";
+  }
+
   if (step === "extracting_images") {
     return "Descargando imágenes";
   }
@@ -221,6 +233,8 @@ export function PilotRunner() {
           setSelectorDrafts({
             storeCodeInputSelectors: (payload.run.browser_config?.selectors?.storeCodeInputSelectors ?? []).join("\n"),
             validatorCodeInputSelectors: (payload.run.browser_config?.selectors?.validatorCodeInputSelectors ?? []).join("\n"),
+            entryButtonSelectors: (payload.run.browser_config?.selectors?.entryButtonSelectors ?? []).join("\n"),
+            startSurveyButtonSelectors: (payload.run.browser_config?.selectors?.startSurveyButtonSelectors ?? []).join("\n"),
             nextButtonSelectors: (payload.run.browser_config?.selectors?.nextButtonSelectors ?? []).join("\n"),
             imageSelectors: (payload.run.browser_config?.selectors?.imageSelectors ?? []).join("\n"),
             optionContainerSelectors: (payload.run.browser_config?.selectors?.optionContainerSelectors ?? []).join("\n")
@@ -572,6 +586,26 @@ export function PilotRunner() {
                   value={selectorDrafts.validatorCodeInputSelectors ?? ""}
                   onChange={(event) =>
                     setSelectorDrafts((current) => ({ ...current, validatorCodeInputSelectors: event.target.value }))
+                  }
+                />
+              </div>
+              <div className="field">
+                <label htmlFor="entrySelectors">Selectors botón Entrar</label>
+                <textarea
+                  id="entrySelectors"
+                  value={selectorDrafts.entryButtonSelectors ?? ""}
+                  onChange={(event) =>
+                    setSelectorDrafts((current) => ({ ...current, entryButtonSelectors: event.target.value }))
+                  }
+                />
+              </div>
+              <div className="field">
+                <label htmlFor="startSurveySelectors">Selectors Iniciar encuesta</label>
+                <textarea
+                  id="startSurveySelectors"
+                  value={selectorDrafts.startSurveyButtonSelectors ?? ""}
+                  onChange={(event) =>
+                    setSelectorDrafts((current) => ({ ...current, startSurveyButtonSelectors: event.target.value }))
                   }
                 />
               </div>
