@@ -19,11 +19,15 @@ type RunSummary = {
   final_code: string | null;
   created_at: string;
   completed_at: string | null;
+  last_error?: string | null;
 };
 
 type RunDetails = {
   run: RunSummary & {
     browser_session_id?: string | null;
+    browser_config?: {
+      selectors?: Record<string, string[]>;
+    } | null;
     last_error?: string | null;
     last_heartbeat_at?: string | null;
     current_screenshot_updated_at?: string | null;
@@ -83,6 +87,10 @@ function getStatusTone(status: string) {
     return "danger";
   }
 
+  if (status === "needs_selector_calibration" || status === "human_review") {
+    return "warn";
+  }
+
   if (status === "paused") {
     return "warn";
   }
@@ -115,6 +123,14 @@ function getOperationalStep(step: string | null, questionIndex: number | null) {
     return "Descargando imágenes";
   }
 
+  if (step === "needs_selector_calibration" || step === "dispatch_failed") {
+    return "Requiere calibración";
+  }
+
+  if (step === "human_review" || step === "completion_gate") {
+    return "Requiere revisión humana";
+  }
+
   if (step === "selecting_used_images") {
     return "Seleccionando imágenes usadas";
   }
@@ -140,6 +156,14 @@ function getTimelineEvents(events: RunDetails["events"]) {
     .slice(0, 10);
 }
 
+function getCalibrationEvents(events: RunDetails["events"]) {
+  return events.filter((event) => {
+    const selectorUsed = event.details?.selectorUsed;
+    const selectorsUsed = event.details?.selectorsUsed;
+    return typeof selectorUsed === "string" || Array.isArray(selectorsUsed);
+  });
+}
+
 export function PilotRunner() {
   const [surveyUrl, setSurveyUrl] = useState(process.env.NEXT_PUBLIC_SURVEY_URL ?? "");
   const [storeCode, setStoreCode] = useState("");
@@ -151,6 +175,9 @@ export function PilotRunner() {
   const [isStopping, setIsStopping] = useState(false);
   const [statusNotice, setStatusNotice] = useState<string | null>(null);
   const [errorNotice, setErrorNotice] = useState<string | null>(null);
+  const [selectorDrafts, setSelectorDrafts] = useState<Record<string, string>>({});
+  const [isSavingSelectors, setIsSavingSelectors] = useState(false);
+  const [selectorDraftsRunId, setSelectorDraftsRunId] = useState<string | null>(null);
 
   useEffect(() => {
     let cancelled = false;
@@ -190,6 +217,16 @@ export function PilotRunner() {
 
       if (!cancelled) {
         setActiveRun(payload);
+        if (selectorDraftsRunId !== payload.run.id) {
+          setSelectorDrafts({
+            storeCodeInputSelectors: (payload.run.browser_config?.selectors?.storeCodeInputSelectors ?? []).join("\n"),
+            validatorCodeInputSelectors: (payload.run.browser_config?.selectors?.validatorCodeInputSelectors ?? []).join("\n"),
+            nextButtonSelectors: (payload.run.browser_config?.selectors?.nextButtonSelectors ?? []).join("\n"),
+            imageSelectors: (payload.run.browser_config?.selectors?.imageSelectors ?? []).join("\n"),
+            optionContainerSelectors: (payload.run.browser_config?.selectors?.optionContainerSelectors ?? []).join("\n")
+          });
+          setSelectorDraftsRunId(payload.run.id);
+        }
       }
     }
 
@@ -214,6 +251,7 @@ export function PilotRunner() {
       .find(Boolean);
   }, [activeRun]);
   const timelineEvents = activeRun ? getTimelineEvents(activeRun.events) : [];
+  const calibrationEvents = activeRun ? getCalibrationEvents(activeRun.events).slice(0, 8) : [];
   const currentAction = getCurrentAction(latestEvent);
   const currentStep = activeRun
     ? getOperationalStep(activeRun.run.current_step, activeRun.run.current_question_index)
@@ -305,6 +343,47 @@ export function PilotRunner() {
     }
   }
 
+  async function onSaveCalibration() {
+    if (!activeRunId) {
+      return;
+    }
+
+    setIsSavingSelectors(true);
+    setErrorNotice(null);
+
+    try {
+      const selectors = Object.fromEntries(
+        Object.entries(selectorDrafts).map(([key, value]) => [
+          key,
+          value
+            .split("\n")
+            .map((item) => item.trim())
+            .filter(Boolean)
+        ])
+      );
+
+      const response = await fetch(`/api/pilot-runs/${activeRunId}`, {
+        method: "PATCH",
+        headers: {
+          "content-type": "application/json"
+        },
+        body: JSON.stringify({ selectors })
+      });
+      const payload = (await response.json()) as { message?: string; error?: string };
+
+      if (!response.ok) {
+        throw new Error(payload.error ?? payload.message ?? "No se pudo guardar la calibración.");
+      }
+
+      setSelectorDraftsRunId(null);
+      setStatusNotice(payload.message ?? "Calibración guardada.");
+    } catch (error) {
+      setErrorNotice(error instanceof Error ? error.message : "No se pudo guardar la calibración.");
+    } finally {
+      setIsSavingSelectors(false);
+    }
+  }
+
   return (
     <section className="pilot-console">
       <header className="pilot-hero">
@@ -321,7 +400,7 @@ export function PilotRunner() {
         ) : null}
       </header>
 
-      <div className="pilot-three-column">
+      <div className="pilot-main-layout">
         <section className="card control-panel">
           <div className="panel-header">
             <span className="eyebrow">Configuración</span>
@@ -418,7 +497,9 @@ export function PilotRunner() {
 
           <p className="live-browser-action">Acción actual: {currentAction}</p>
         </section>
+      </div>
 
+      <div className="pilot-secondary-layout">
         <section className="card agent-status-panel">
           <div className="panel-header">
             <span className="eyebrow">Agent Status</span>
@@ -461,6 +542,95 @@ export function PilotRunner() {
               </article>
             ) : null}
           </div>
+        </section>
+
+        <section className="card advanced-panel">
+          <div className="panel-header">
+            <span className="eyebrow">Advanced</span>
+            <h2>Calibración</h2>
+          </div>
+          <details>
+            <summary>Ver panel avanzado de calibración</summary>
+            <p className="advanced-copy">
+              Úsalo solo si el survey requiere ajustar selectores. La operación normal no necesita este panel.
+            </p>
+            <div className="advanced-grid">
+              <div className="field">
+                <label htmlFor="storeSelectors">Selectors store code</label>
+                <textarea
+                  id="storeSelectors"
+                  value={selectorDrafts.storeCodeInputSelectors ?? ""}
+                  onChange={(event) =>
+                    setSelectorDrafts((current) => ({ ...current, storeCodeInputSelectors: event.target.value }))
+                  }
+                />
+              </div>
+              <div className="field">
+                <label htmlFor="validatorSelectors">Selectors validator code</label>
+                <textarea
+                  id="validatorSelectors"
+                  value={selectorDrafts.validatorCodeInputSelectors ?? ""}
+                  onChange={(event) =>
+                    setSelectorDrafts((current) => ({ ...current, validatorCodeInputSelectors: event.target.value }))
+                  }
+                />
+              </div>
+              <div className="field">
+                <label htmlFor="nextSelectors">Selectors botón siguiente</label>
+                <textarea
+                  id="nextSelectors"
+                  value={selectorDrafts.nextButtonSelectors ?? ""}
+                  onChange={(event) =>
+                    setSelectorDrafts((current) => ({ ...current, nextButtonSelectors: event.target.value }))
+                  }
+                />
+              </div>
+              <div className="field">
+                <label htmlFor="imageSelectors">Selectors imágenes</label>
+                <textarea
+                  id="imageSelectors"
+                  value={selectorDrafts.imageSelectors ?? ""}
+                  onChange={(event) =>
+                    setSelectorDrafts((current) => ({ ...current, imageSelectors: event.target.value }))
+                  }
+                />
+              </div>
+              <div className="field">
+                <label htmlFor="optionSelectors">Selectors opciones</label>
+                <textarea
+                  id="optionSelectors"
+                  value={selectorDrafts.optionContainerSelectors ?? ""}
+                  onChange={(event) =>
+                    setSelectorDrafts((current) => ({ ...current, optionContainerSelectors: event.target.value }))
+                  }
+                />
+              </div>
+            </div>
+            <div className="actions">
+              <button className="button secondary" type="button" onClick={onSaveCalibration} disabled={isSavingSelectors}>
+                {isSavingSelectors ? "Guardando…" : "Guardar calibración"}
+              </button>
+            </div>
+            {calibrationEvents.length > 0 ? (
+              <div className="timeline-list">
+                {calibrationEvents.map((event) => (
+                  <article key={event.id} className="timeline-item">
+                    <span className="timeline-time">{formatTimestamp(event.created_at)}</span>
+                    <strong>{event.message}</strong>
+                    <span className="timeline-step">
+                      {typeof event.details?.selectorUsed === "string"
+                        ? `Selector: ${event.details.selectorUsed}`
+                        : Array.isArray(event.details?.selectorsUsed)
+                          ? `Selectores: ${event.details.selectorsUsed.join(", ")}`
+                          : "Sin selector"}
+                    </span>
+                  </article>
+                ))}
+              </div>
+            ) : (
+              <div className="timeline-empty">Aún no hay trazas de calibración de selectores.</div>
+            )}
+          </details>
         </section>
       </div>
 

@@ -17,6 +17,55 @@ import { createSignedStorageUrl, uploadBufferToStorage, uploadJsonArtifact } fro
 import { mergePilotBrowserConfig } from "@/lib/pilot/config";
 import type { ExtractedSurveyImage, SurveySelectorConfig } from "@/lib/pilot/types";
 
+class PilotFlowError extends Error {
+  constructor(
+    message: string,
+    readonly runStatus: "failed" | "needs_selector_calibration" | "human_review",
+    readonly step: string
+  ) {
+    super(message);
+    this.name = "PilotFlowError";
+  }
+}
+
+type VisibleMatch = {
+  locator: Locator;
+  selector: string;
+};
+
+type ExtractedOption = {
+  text: string;
+  locator: Locator;
+  selectorSource: string;
+};
+
+type ScreenState =
+  | {
+      kind: "images";
+      imageLinks: string[];
+      matchedImageSelectors: string[];
+    }
+  | {
+      kind: "question";
+      imageLinks: string[];
+      matchedImageSelectors: string[];
+    }
+  | {
+      kind: "used_images";
+      imageLinks: string[];
+      matchedImageSelectors: string[];
+    }
+  | {
+      kind: "completion";
+      imageLinks: string[];
+      matchedImageSelectors: string[];
+    }
+  | {
+      kind: "unknown";
+      imageLinks: string[];
+      matchedImageSelectors: string[];
+    };
+
 function normalizeText(value: string) {
   return value
     .normalize("NFD")
@@ -26,13 +75,16 @@ function normalizeText(value: string) {
     .toLowerCase();
 }
 
-async function firstVisible(page: Page, selectors: string[]) {
+async function firstVisible(page: Page, selectors: string[]): Promise<VisibleMatch | null> {
   for (const selector of selectors) {
     const locator = page.locator(selector).first();
     if (await locator.count()) {
       try {
         if (await locator.isVisible()) {
-          return locator;
+          return {
+            locator,
+            selector
+          };
         }
       } catch {
         continue;
@@ -44,23 +96,25 @@ async function firstVisible(page: Page, selectors: string[]) {
 }
 
 async function fillFirstAvailable(page: Page, selectors: string[], value: string) {
-  const locator = await firstVisible(page, selectors);
+  const match = await firstVisible(page, selectors);
 
-  if (!locator) {
+  if (!match) {
     throw new Error(`No se encontró un input para completar valor: ${value}.`);
   }
 
-  await locator.fill(value);
+  await match.locator.fill(value);
+  return match;
 }
 
 async function clickNext(page: Page, selectors: string[]) {
-  const locator = await firstVisible(page, selectors);
+  const match = await firstVisible(page, selectors);
 
-  if (!locator) {
+  if (!match) {
     throw new Error("No se encontró botón para avanzar.");
   }
 
-  await locator.click();
+  await match.locator.click();
+  return match;
 }
 
 async function pageLooksLikeUsedImages(page: Page) {
@@ -103,7 +157,7 @@ async function extractQuestionText(page: Page) {
 }
 
 async function extractOptions(page: Page, selectors: SurveySelectorConfig) {
-  const options: Array<{ text: string; locator: Locator }> = [];
+  const options: ExtractedOption[] = [];
   const radioInputs = page.locator('input[type="radio"]');
   const radioCount = await radioInputs.count();
 
@@ -135,7 +189,8 @@ async function extractOptions(page: Page, selectors: SurveySelectorConfig) {
 
     options.push({
       text: labelText,
-      locator: labelLocator ?? input
+      locator: labelLocator ?? input,
+      selectorSource: id ? `label[for="${id}"]` : "input[type=radio]"
     });
   }
 
@@ -151,7 +206,7 @@ async function extractOptions(page: Page, selectors: SurveySelectorConfig) {
       const locator = items.nth(index);
       const text = (await locator.innerText()).trim();
       if (text) {
-        options.push({ text, locator });
+        options.push({ text, locator, selectorSource: selector });
       }
     }
   }
@@ -161,6 +216,7 @@ async function extractOptions(page: Page, selectors: SurveySelectorConfig) {
 
 async function extractImageLinks(page: Page, selectors: SurveySelectorConfig) {
   const urls = new Set<string>();
+  const matchedImageSelectors = new Set<string>();
 
   for (const selector of selectors.imageSelectors) {
     const handles = await page.locator(selector).evaluateAll((elements) =>
@@ -182,11 +238,112 @@ async function extractImageLinks(page: Page, selectors: SurveySelectorConfig) {
     for (const handle of handles) {
       if (typeof handle === "string" && handle.startsWith("http")) {
         urls.add(handle);
+        matchedImageSelectors.add(selector);
       }
     }
   }
 
-  return [...urls];
+  return {
+    urls: [...urls],
+    matchedImageSelectors: [...matchedImageSelectors]
+  };
+}
+
+async function assertFieldValue({
+  locator,
+  expectedValue,
+  fieldName,
+  step
+}: {
+  locator: Locator;
+  expectedValue: string;
+  fieldName: string;
+  step: string;
+}) {
+  const currentValue = await locator.inputValue().catch(async () => {
+    return (await locator.getAttribute("value")) ?? "";
+  });
+
+  if (currentValue.trim() !== expectedValue.trim()) {
+    throw new PilotFlowError(
+      `No se pudo confirmar que el campo ${fieldName} quedó lleno correctamente.`,
+      "needs_selector_calibration",
+      step
+    );
+  }
+}
+
+async function classifyScreen(page: Page, selectors: SurveySelectorConfig): Promise<ScreenState> {
+  const { urls, matchedImageSelectors } = await extractImageLinks(page, selectors);
+
+  if (await pageLooksLikeUsedImages(page)) {
+    return {
+      kind: "used_images",
+      imageLinks: urls,
+      matchedImageSelectors
+    };
+  }
+
+  if (await pageLooksLikeCompletion(page)) {
+    return {
+      kind: "completion",
+      imageLinks: urls,
+      matchedImageSelectors
+    };
+  }
+
+  if (await pageLooksLikeQuestion(page)) {
+    return {
+      kind: "question",
+      imageLinks: urls,
+      matchedImageSelectors
+    };
+  }
+
+  if (urls.length > 0) {
+    return {
+      kind: "images",
+      imageLinks: urls,
+      matchedImageSelectors
+    };
+  }
+
+  return {
+    kind: "unknown",
+    imageLinks: urls,
+    matchedImageSelectors
+  };
+}
+
+async function waitForExpectedScreen({
+  page,
+  selectors,
+  expectedKinds,
+  timeoutMs,
+  failureStep,
+  failureMessage
+}: {
+  page: Page;
+  selectors: SurveySelectorConfig;
+  expectedKinds: ScreenState["kind"][];
+  timeoutMs: number;
+  failureStep: string;
+  failureMessage: string;
+}) {
+  const startedAt = Date.now();
+
+  while (Date.now() - startedAt < timeoutMs) {
+    await page.waitForLoadState("networkidle").catch(() => null);
+    const screen = await classifyScreen(page, selectors);
+
+    if (expectedKinds.includes(screen.kind)) {
+      return screen;
+    }
+
+    await page.waitForTimeout(750);
+  }
+
+  throw new PilotFlowError(failureMessage, "needs_selector_calibration", failureStep);
 }
 
 async function captureAndUploadScreenshot({
@@ -423,7 +580,10 @@ async function selectBestMatchingOption(
   }
 
   await directMatch.locator.click();
-  return directMatch.text;
+  return {
+    selectedText: directMatch.text,
+    selectorSource: directMatch.selectorSource
+  };
 }
 
 async function extractFinalCode(page: Page, selectors: SurveySelectorConfig) {
@@ -631,7 +791,13 @@ export async function runPilotSurvey(runId: string) {
         storeCode
       }
     });
-    await fillFirstAvailable(page, browserConfig.selectors.storeCodeInputSelectors, storeCode);
+    const storeCodeMatch = await fillFirstAvailable(page, browserConfig.selectors.storeCodeInputSelectors, storeCode);
+    await assertFieldValue({
+      locator: storeCodeMatch.locator,
+      expectedValue: storeCode,
+      fieldName: "store code",
+      step: "opening_survey"
+    });
     await captureActionScreenshot({
       page,
       runId,
@@ -639,16 +805,18 @@ export async function runPilotSurvey(runId: string) {
       action: "after-fill-store-code",
       message: "Store code visible en el formulario.",
       metadata: {
-        storeCode
+        storeCode,
+        selectorUsed: storeCodeMatch.selector
       }
     });
     await emitWorkerEvent({
       runId,
       eventType: "store_code_filled",
       step: "opening_survey",
-      message: "Store code cargado en el formulario.",
+      message: "Campo store code llenado.",
       metadata: {
-        storeCode
+        storeCode,
+        selectorUsed: storeCodeMatch.selector
       }
     });
 
@@ -668,21 +836,35 @@ export async function runPilotSurvey(runId: string) {
       action: "before-fill-validator-code",
       message: "Antes de llenar validator code."
     });
-    await fillFirstAvailable(page, browserConfig.selectors.validatorCodeInputSelectors, validatorCode);
+    const validatorCodeMatch = await fillFirstAvailable(
+      page,
+      browserConfig.selectors.validatorCodeInputSelectors,
+      validatorCode
+    );
+    await assertFieldValue({
+      locator: validatorCodeMatch.locator,
+      expectedValue: validatorCode,
+      fieldName: "validator code",
+      step: "opening_survey"
+    });
     await captureActionScreenshot({
       page,
       runId,
       step: "opening_survey",
       action: "after-fill-validator-code",
-      message: "Validator code visible en el formulario."
+      message: "Validator code visible en el formulario.",
+      metadata: {
+        selectorUsed: validatorCodeMatch.selector
+      }
     });
     await emitWorkerEvent({
       runId,
       eventType: "validator_code_filled",
       step: "opening_survey",
-      message: "Validator code cargado en el formulario.",
+      message: "Campo validator code llenado.",
       metadata: {
-        validatorCodeLength: validatorCode.length
+        validatorCodeLength: validatorCode.length,
+        selectorUsed: validatorCodeMatch.selector
       }
     });
 
@@ -702,21 +884,43 @@ export async function runPilotSurvey(runId: string) {
       action: "before-click-next-open-survey",
       message: "Antes de hacer clic en siguiente para abrir la encuesta."
     });
-    await clickNext(page, browserConfig.selectors.nextButtonSelectors);
+    const nextMatch = await clickNext(page, browserConfig.selectors.nextButtonSelectors);
+    const surveyEntryScreen = await waitForExpectedScreen({
+      page,
+      selectors: browserConfig.selectors,
+      expectedKinds: ["images", "question", "used_images", "completion"],
+      timeoutMs: 12_000,
+      failureStep: "opening_survey",
+      failureMessage:
+        "No se pudo detectar la pantalla posterior al clic en siguiente. Se requiere calibración de selectores."
+    });
     await captureActionScreenshot({
       page,
       runId,
       step: "opening_survey",
       action: "after-click-next-open-survey",
-      message: "Pantalla posterior al clic en siguiente."
+      message: "Pantalla posterior al clic en siguiente.",
+      metadata: {
+        detectedScreen: surveyEntryScreen.kind
+      }
     });
     await emitWorkerEvent({
       runId,
       eventType: "next_clicked",
       step: "opening_survey",
-      message: "Click en siguiente para abrir la encuesta.",
+      message: "Clic en siguiente.",
       metadata: {
-        context: "open_survey"
+        context: "open_survey",
+        selectorUsed: nextMatch.selector
+      }
+    });
+    await emitWorkerEvent({
+      runId,
+      eventType: "screen_detected",
+      step: "opening_survey",
+      message: "Pantalla detectada.",
+      metadata: {
+        screen: surveyEntryScreen.kind
       }
     });
 
@@ -726,9 +930,20 @@ export async function runPilotSurvey(runId: string) {
       current_question_text: null
     });
 
-    await page.waitForLoadState("networkidle");
+    const imageScreen =
+      surveyEntryScreen.kind === "images"
+        ? surveyEntryScreen
+        : await waitForExpectedScreen({
+            page,
+            selectors: browserConfig.selectors,
+            expectedKinds: ["images", "question", "used_images", "completion"],
+            timeoutMs: 4_000,
+            failureStep: "extracting_images",
+            failureMessage:
+              "No se pudo clasificar la pantalla posterior a la apertura de la encuesta. Se requiere calibración."
+          });
 
-    const imageLinks = await extractImageLinks(page, browserConfig.selectors);
+    const imageLinks = imageScreen.imageLinks;
     await captureActionScreenshot({
       page,
       runId,
@@ -746,7 +961,8 @@ export async function runPilotSurvey(runId: string) {
       message: "Links de imágenes detectados.",
       metadata: {
         count: imageLinks.length,
-        urls: imageLinks
+        urls: imageLinks,
+        selectorsUsed: imageScreen.matchedImageSelectors
       }
     });
 
@@ -820,21 +1036,43 @@ export async function runPilotSurvey(runId: string) {
       action: "before-click-next-after-images",
       message: "Antes de avanzar después de detectar imágenes."
     });
-    await clickNext(page, browserConfig.selectors.nextButtonSelectors);
+    const afterImagesNextMatch = await clickNext(page, browserConfig.selectors.nextButtonSelectors);
+    const postImageScreen = await waitForExpectedScreen({
+      page,
+      selectors: browserConfig.selectors,
+      expectedKinds: ["question", "used_images", "completion"],
+      timeoutMs: 12_000,
+      failureStep: "extracting_images",
+      failureMessage:
+        "No se detectó una pantalla válida después de extraer imágenes. Se requiere calibración del survey."
+    });
     await captureActionScreenshot({
       page,
       runId,
       step: "extracting_images",
       action: "after-click-next-after-images",
-      message: "Pantalla posterior a la extracción de imágenes."
+      message: "Pantalla posterior a la extracción de imágenes.",
+      metadata: {
+        detectedScreen: postImageScreen.kind
+      }
     });
     await emitWorkerEvent({
       runId,
       eventType: "next_clicked",
       step: "extracting_images",
-      message: "Click en siguiente después de extraer imágenes.",
+      message: "Clic en siguiente.",
       metadata: {
-        context: "after_image_extraction"
+        context: "after_image_extraction",
+        selectorUsed: afterImagesNextMatch.selector
+      }
+    });
+    await emitWorkerEvent({
+      runId,
+      eventType: "screen_detected",
+      step: "extracting_images",
+      message: "Pantalla detectada.",
+      metadata: {
+        screen: postImageScreen.kind
       }
     });
 
@@ -865,28 +1103,33 @@ export async function runPilotSurvey(runId: string) {
     const usedImageMap = new Map<string, ExtractedSurveyImage>();
 
     while (questionIndex < 100) {
-      await page.waitForLoadState("networkidle");
+      const currentScreen = await classifyScreen(page, browserConfig.selectors);
 
-      if (await pageLooksLikeUsedImages(page)) {
+      if (currentScreen.kind === "used_images") {
         break;
       }
 
-      if (await pageLooksLikeCompletion(page)) {
+      if (currentScreen.kind === "completion") {
         break;
       }
 
-      if (!(await pageLooksLikeQuestion(page))) {
+      if (currentScreen.kind !== "question") {
         await emitWorkerEvent({
           runId,
           level: "warn",
-          eventType: "question_not_detected",
+          eventType: "screen_not_detected",
           step: "question_loop",
-          message: "No se detectó una pantalla de pregunta; se intenta continuar.",
+          message: "Pantalla no detectada.",
           metadata: {
-            questionIndex
+            questionIndex,
+            detectedScreen: currentScreen.kind
           }
         });
-        break;
+        throw new PilotFlowError(
+          "No se detectó una pantalla de pregunta válida. Se requiere calibración del survey.",
+          "needs_selector_calibration",
+          "question_loop"
+        );
       }
 
       const screenshot = await captureAndUploadScreenshot({
@@ -1050,7 +1293,7 @@ export async function runPilotSurvey(runId: string) {
         screenshotPath: screenshot.storagePath
       });
 
-      const selectedText = await selectBestMatchingOption(
+      const selection = await selectBestMatchingOption(
         page,
         browserConfig.selectors,
         best.analysis.respuesta_final_texto,
@@ -1064,7 +1307,8 @@ export async function runPilotSurvey(runId: string) {
         message: `Respuesta seleccionada para pregunta ${questionIndex + 1}.`,
         metadata: {
           questionIndex,
-          selectedText
+          selectedText: selection.selectedText,
+          selectorUsed: selection.selectorSource
         }
       });
       await emitWorkerEvent({
@@ -1075,7 +1319,7 @@ export async function runPilotSurvey(runId: string) {
         metadata: {
           questionIndex,
           questionId,
-          selectedText,
+          selectedText: selection.selectedText,
           selectedLabel: best.analysis.respuesta_final_label
         },
         screenshotBucket: STORAGE_BUCKETS.questionScreenshots,
@@ -1086,7 +1330,7 @@ export async function runPilotSurvey(runId: string) {
 
       await upsertAnswerRecord(questionId, {
         selected_option_label: best.analysis.respuesta_final_label,
-        selected_option_text: selectedText,
+        selected_option_text: selection.selectedText,
         internal_response: best.analysis.respuesta,
         confidence: best.analysis.confianza,
         explanation: best.analysis.explicacion,
@@ -1127,7 +1371,7 @@ export async function runPilotSurvey(runId: string) {
           questionText,
           questionIndex,
           questionId,
-          selectedText,
+          selectedText: selection.selectedText,
           evidenceImageId: best.image.imageRecordId,
           confidence: best.analysis.confianza,
           supervisorStatus: best.analysis.decision_supervisor.status
@@ -1138,7 +1382,7 @@ export async function runPilotSurvey(runId: string) {
 
       await updateSurveyRun(runId, {
         last_reasoning_summary: best.analysis.explicacion,
-        last_selected_option_text: selectedText,
+        last_selected_option_text: selection.selectedText,
         last_supervisor_decision: best.analysis.decision_supervisor.status
       });
 
@@ -1162,7 +1406,16 @@ export async function runPilotSurvey(runId: string) {
           questionIndex
         }
       });
-      await clickNext(page, browserConfig.selectors.nextButtonSelectors);
+      const afterQuestionNextMatch = await clickNext(page, browserConfig.selectors.nextButtonSelectors);
+      const postQuestionScreen = await waitForExpectedScreen({
+        page,
+        selectors: browserConfig.selectors,
+        expectedKinds: ["question", "used_images", "completion"],
+        timeoutMs: 12_000,
+        failureStep: `question_${questionIndex + 1}`,
+        failureMessage:
+          "No se detectó la pantalla posterior a responder la pregunta. Se requiere calibración."
+      });
       await captureActionScreenshot({
         page,
         runId,
@@ -1170,28 +1423,40 @@ export async function runPilotSurvey(runId: string) {
         action: "after-click-next-after-question",
         message: `Pantalla posterior a la pregunta ${questionIndex + 1}.`,
         metadata: {
-          questionIndex
+          questionIndex,
+          detectedScreen: postQuestionScreen.kind
         }
       });
       await emitWorkerEvent({
         runId,
         eventType: "next_clicked",
         step: `question_${questionIndex + 1}`,
-        message: `Click en siguiente después de pregunta ${questionIndex + 1}.`,
+        message: "Clic en siguiente.",
         metadata: {
           questionIndex,
-          context: "after_question_answer"
+          context: "after_question_answer",
+          selectorUsed: afterQuestionNextMatch.selector
+        }
+      });
+      await emitWorkerEvent({
+        runId,
+        eventType: "screen_detected",
+        step: `question_${questionIndex + 1}`,
+        message: "Pantalla detectada.",
+        metadata: {
+          screen: postQuestionScreen.kind
         }
       });
       questionIndex += 1;
     }
 
-    await updateSurveyRun(runId, {
-      status: "selecting_used_images",
-      current_step: "selecting_used_images"
-    });
+    const endLoopScreen = await classifyScreen(page, browserConfig.selectors);
 
-    if (await pageLooksLikeUsedImages(page)) {
+    if (endLoopScreen.kind === "used_images") {
+      await updateSurveyRun(runId, {
+        status: "selecting_used_images",
+        current_step: "selecting_used_images"
+      });
       await emitWorkerEvent({
         runId,
         eventType: "used_images_selection_started",
@@ -1251,27 +1516,72 @@ export async function runPilotSurvey(runId: string) {
         action: "before-click-next-used-images",
         message: "Antes de avanzar después de seleccionar imágenes usadas."
       });
-      await clickNext(page, browserConfig.selectors.nextButtonSelectors);
+      const usedImagesNextMatch = await clickNext(page, browserConfig.selectors.nextButtonSelectors);
+      const postUsedImagesScreen = await waitForExpectedScreen({
+        page,
+        selectors: browserConfig.selectors,
+        expectedKinds: ["completion"],
+        timeoutMs: 12_000,
+        failureStep: "selecting_used_images",
+        failureMessage:
+          "No se detectó una pantalla final válida después de seleccionar imágenes usadas."
+      });
       await captureActionScreenshot({
         page,
         runId,
         step: "selecting_used_images",
         action: "after-click-next-used-images",
-        message: "Pantalla posterior a la selección de imágenes usadas."
+        message: "Pantalla posterior a la selección de imágenes usadas.",
+        metadata: {
+          detectedScreen: postUsedImagesScreen.kind
+        }
       });
       await emitWorkerEvent({
         runId,
         eventType: "next_clicked",
         step: "selecting_used_images",
-        message: "Click en siguiente después de seleccionar imágenes usadas.",
+        message: "Clic en siguiente.",
         metadata: {
-          context: "after_used_images_selection"
+          context: "after_used_images_selection",
+          selectorUsed: usedImagesNextMatch.selector
         }
       });
+      await emitWorkerEvent({
+        runId,
+        eventType: "screen_detected",
+        step: "selecting_used_images",
+        message: "Pantalla detectada.",
+        metadata: {
+          screen: postUsedImagesScreen.kind
+        }
+      });
+    } else if (endLoopScreen.kind !== "completion") {
+      await emitWorkerEvent({
+        runId,
+        level: "warn",
+        eventType: "screen_not_detected",
+        step: "completion_gate",
+        message: "Pantalla no detectada.",
+        metadata: {
+          detectedScreen: endLoopScreen.kind
+        }
+      });
+      throw new PilotFlowError(
+        "No se pudo confirmar una pantalla final válida. Se requiere revisión humana o calibración.",
+        "human_review",
+        "completion_gate"
+      );
     }
 
-    await page.waitForLoadState("networkidle");
-
+    const completionScreen = await waitForExpectedScreen({
+      page,
+      selectors: browserConfig.selectors,
+      expectedKinds: ["completion"],
+      timeoutMs: 5_000,
+      failureStep: "completion",
+      failureMessage:
+        "No se pudo confirmar la pantalla de finalización de la encuesta. Se requiere revisión humana."
+    });
     const finalCode = await extractFinalCode(page, browserConfig.selectors);
     await captureActionScreenshot({
       page,
@@ -1280,7 +1590,8 @@ export async function runPilotSurvey(runId: string) {
       action: "final-screen",
       message: "Pantalla final del navegador.",
       metadata: {
-        finalCode
+        finalCode,
+        detectedScreen: completionScreen.kind
       }
     });
     await emitWorkerEvent({
@@ -1292,6 +1603,14 @@ export async function runPilotSurvey(runId: string) {
         finalCode
       }
     });
+
+    if (!finalCode) {
+      throw new PilotFlowError(
+        "No se pudo detectar el código final de confirmación. Se requiere revisión humana.",
+        "human_review",
+        "completion"
+      );
+    }
 
     await updateSurveyRun(runId, {
       status: "completed",
@@ -1318,10 +1637,19 @@ export async function runPilotSurvey(runId: string) {
       bucket: STORAGE_BUCKETS.errorScreenshots
     }).catch(() => null);
 
+    const normalizedError =
+      error instanceof PilotFlowError
+        ? error
+        : new PilotFlowError(
+            error instanceof Error ? error.message : "Error desconocido en worker.",
+            "failed",
+            "failed"
+          );
+
     await updateSurveyRun(runId, {
-      status: "failed",
-      current_step: "failed",
-      last_error: error instanceof Error ? error.message : "Error desconocido en worker.",
+      status: normalizedError.runStatus,
+      current_step: normalizedError.step,
+      last_error: normalizedError.message,
       error_screenshot_bucket: screenshot ? STORAGE_BUCKETS.errorScreenshots : null,
       error_screenshot_path: screenshot?.storagePath ?? null
     });
@@ -1330,16 +1658,17 @@ export async function runPilotSurvey(runId: string) {
       runId,
       level: "error",
       eventType: "run_failed",
-      step: "failed",
-      message: error instanceof Error ? error.message : "Error desconocido en worker.",
+      step: normalizedError.step,
+      message: normalizedError.message,
       metadata: {
-        currentStep: "failed"
+        currentStep: normalizedError.step,
+        statusAssigned: normalizedError.runStatus
       },
       screenshotBucket: screenshot ? STORAGE_BUCKETS.errorScreenshots : undefined,
       screenshotPath: screenshot?.storagePath
     });
 
-    throw error;
+    throw normalizedError;
   } finally {
     stopLiveBrowserView?.();
     await browser.close();
