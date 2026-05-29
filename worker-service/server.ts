@@ -1,9 +1,12 @@
+import fs from "node:fs";
 import { createServer, type IncomingMessage, type ServerResponse } from "node:http";
+import path from "node:path";
 import { URL } from "node:url";
 import { loadEnvConfig } from "@next/env";
 import { createSupabaseAdminClient } from "@/lib/supabase/admin";
 import { getOpenAIClient } from "@/lib/openai";
 import { createBrowserEvent, getSurveyRunDetails, updateSurveyRun } from "@/lib/pilot/db";
+import { runMinimalSurveyFlow } from "@/lib/pilot/minimal-worker";
 import { diagnosePilotRunScreen, runPilotSurvey } from "@/lib/pilot/worker";
 
 const port = Number(process.env.PILOT_WORKER_API_PORT ?? process.env.PORT ?? 4001);
@@ -85,6 +88,30 @@ function writeJson(response: ServerResponse, statusCode: number, payload: unknow
   response.statusCode = statusCode;
   response.setHeader("content-type", "application/json");
   response.end(JSON.stringify(payload));
+}
+
+function isAllowedArtifactPath(targetPath: string) {
+  const normalized = path.resolve(targetPath);
+  const allowedRoot = path.resolve(process.cwd(), "output", "playwright", "minimal-runs");
+  return normalized.startsWith(allowedRoot);
+}
+
+function getArtifactContentType(targetPath: string) {
+  const lower = targetPath.toLowerCase();
+
+  if (lower.endsWith(".png")) {
+    return "image/png";
+  }
+
+  if (lower.endsWith(".jpg") || lower.endsWith(".jpeg")) {
+    return "image/jpeg";
+  }
+
+  if (lower.endsWith(".json")) {
+    return "application/json";
+  }
+
+  return "text/plain; charset=utf-8";
 }
 
 async function withTimeout<T>(promise: Promise<T>, timeoutMs: number, label: string) {
@@ -332,6 +359,59 @@ async function handleDiagnoseRun(runId: string, response: ServerResponse) {
   });
 }
 
+async function handleMinimalRunStart(request: IncomingMessage, response: ServerResponse) {
+  const body = await readJsonBody(request);
+  const surveyUrl = typeof body.surveyUrl === "string" ? body.surveyUrl.trim() : "";
+  const storeCode = typeof body.storeCode === "string" ? body.storeCode.trim() : "";
+  const validatorCode = typeof body.validatorCode === "string" ? body.validatorCode.trim() : "";
+
+  log("info", "Minimal run payload received.", {
+    path: "/minimal-runs/start",
+    origin: request.headers.origin ?? null,
+    body: {
+      surveyUrl,
+      storeCode,
+      validatorCode
+    }
+  });
+
+  if (!surveyUrl || !storeCode || !validatorCode) {
+    const payload = {
+      ok: false,
+      error: "missing_required_fields"
+    };
+    writeJson(response, 400, payload);
+    log("warn", "Request completed.", {
+      method: "POST",
+      path: "/minimal-runs/start",
+      status: 400,
+      body: payload
+    });
+    return;
+  }
+
+  const result = await runMinimalSurveyFlow({
+    surveyUrl,
+    storeCode,
+    validatorCode
+  });
+
+  writeJson(response, result.ok ? 200 : 500, result);
+  log("info", "Request completed.", {
+    method: "POST",
+    path: "/minimal-runs/start",
+    status: result.ok ? 200 : 500,
+    body: {
+      ok: result.ok,
+      currentStep: result.currentStep,
+      finalUrl: result.finalUrl,
+      detectedFirstQuestion: result.detectedFirstQuestion,
+      radioCount: result.radioCount,
+      finalBodyTextLength: result.finalBodyTextLength
+    }
+  });
+}
+
 const server = createServer(async (request, response) => {
   const method = request.method ?? "GET";
   const url = new URL(request.url ?? "/", `http://${request.headers.host ?? `127.0.0.1:${port}`}`);
@@ -380,8 +460,48 @@ const server = createServer(async (request, response) => {
       return;
     }
 
+    if (method === "GET" && url.pathname === "/minimal-runs/artifact") {
+      const filePath = url.searchParams.get("path")?.trim() ?? "";
+
+      if (!filePath || !isAllowedArtifactPath(filePath) || !fs.existsSync(filePath)) {
+        const payload = {
+          ok: false,
+          error: "artifact_not_found"
+        };
+        writeJson(response, 404, payload);
+        log("warn", "Request completed.", {
+          method,
+          path: url.pathname,
+          origin,
+          status: 404,
+          body: payload
+        });
+        return;
+      }
+
+      response.statusCode = 200;
+      response.setHeader("content-type", getArtifactContentType(filePath));
+      response.end(fs.readFileSync(filePath));
+      log("info", "Request completed.", {
+        method,
+        path: url.pathname,
+        origin,
+        status: 200,
+        body: {
+          ok: true,
+          filePath
+        }
+      });
+      return;
+    }
+
     if (method === "POST" && url.pathname === "/runs/start") {
       await handleStartRun(request, response);
+      return;
+    }
+
+    if (method === "POST" && url.pathname === "/minimal-runs/start") {
+      await handleMinimalRunStart(request, response);
       return;
     }
 
