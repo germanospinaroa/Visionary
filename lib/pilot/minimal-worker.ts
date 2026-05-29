@@ -19,6 +19,35 @@ type MinimalWorkerResult = {
     text: string;
   }>;
   detectedFirstQuestion: boolean;
+  probableQuestionText: string | null;
+  pageTextPreview: string;
+  frameCount: number;
+  frameUrls: string[];
+  frameNames: string[];
+  frames: Array<{
+    frameIndex: number;
+    frameName: string;
+    frameUrl: string;
+    textPreview: string;
+    radioCount: number;
+    textareaCount: number;
+    selectCount: number;
+    buttonTexts: string[];
+    visibleLabels: string[];
+  }>;
+  visibleInputs: Array<{
+    tag: string;
+    type: string;
+    name: string;
+    id: string;
+    placeholder: string;
+    label: string;
+  }>;
+  visibleLabels: string[];
+  visibleQuestions: string[];
+  radioCount: number;
+  textareaCount: number;
+  selectCount: number;
   screenshots: string[];
   error?: string;
   stack?: string | null;
@@ -363,29 +392,58 @@ async function findContinueButton(page: Page) {
   return best.frame.locator(buttonSelectors.join(", ")).nth(best.index);
 }
 
-async function detectFirstQuestion(page: Page) {
-  const startedAt = Date.now();
+type SurveyDomSnapshot = {
+  pageTextPreview: string;
+  frameCount: number;
+  frameUrls: string[];
+  frameNames: string[];
+  frames: Array<{
+    frameIndex: number;
+    frameName: string;
+    frameUrl: string;
+    textPreview: string;
+    radioCount: number;
+    textareaCount: number;
+    selectCount: number;
+    buttonTexts: string[];
+    visibleLabels: string[];
+  }>;
+  visibleInputs: Array<{
+    tag: string;
+    type: string;
+    name: string;
+    id: string;
+    placeholder: string;
+    label: string;
+  }>;
+  visibleLabels: string[];
+  visibleQuestions: string[];
+  probableQuestionText: string | null;
+  radioCount: number;
+  textareaCount: number;
+  selectCount: number;
+  validatorVisible: boolean;
+};
 
-  while (Date.now() - startedAt < 15_000) {
-    await page.waitForLoadState("load").catch(() => undefined);
-    await page.waitForTimeout(500);
+function scoreQuestionCandidate(text: string) {
+  const normalized = text.replace(/\s+/g, " ").trim();
+  let score = 0;
 
-    for (const frame of page.frames()) {
-      const question = await frame
+  if (normalized.length >= 18) score += 30;
+  if (normalized.length >= 40) score += 20;
+  if (/[?:]$/.test(normalized) || normalized.includes("?")) score += 25;
+  if (/^\d+[\).\s-]/.test(normalized)) score += 20;
+  if (/[a-záéíóúñ]{4,}/i.test(normalized)) score += 10;
+
+  return score;
+}
+
+async function inspectSurveyDom(page: Page): Promise<SurveyDomSnapshot> {
+  const pageFrames = page.frames();
+  const snapshots = await Promise.all(
+    pageFrames.map(async (frame, frameIndex) =>
+      frame
         .evaluate(() => {
-          const textSelectors = [
-            "legend",
-            "label",
-            "h1",
-            "h2",
-            "h3",
-            "p",
-            "td",
-            "th",
-            "span",
-            "div"
-          ];
-
           const isVisible = (element: Element) => {
             const node = element as HTMLElement;
             const rect = node.getBoundingClientRect();
@@ -399,52 +457,205 @@ async function detectFirstQuestion(page: Page) {
             );
           };
 
-          const controls = Array.from(document.querySelectorAll("input, textarea, select")).filter((element) => {
-            const control = element as HTMLInputElement | HTMLTextAreaElement | HTMLSelectElement;
-            const type = "type" in control ? (control.type ?? "").toLowerCase() : "";
-            return isVisible(element) && !["hidden", "submit", "button", "image"].includes(type);
+          const cleanText = (value: string | null | undefined) =>
+            (value ?? "").replace(/\s+/g, " ").trim();
+
+          const visibleTextNodes = Array.from(
+            document.querySelectorAll("h1, h2, h3, h4, legend, label, p, td, th, span, div")
+          )
+            .filter(isVisible)
+            .map((element) => cleanText(element.textContent))
+            .filter((text) => text.length >= 2);
+
+          const visibleLabels = Array.from(document.querySelectorAll("label, legend"))
+            .filter(isVisible)
+            .map((element) => cleanText(element.textContent))
+            .filter((text) => text.length >= 2);
+
+          const buttonTexts = Array.from(
+            document.querySelectorAll("button, input[type='submit'], input[type='button'], [role='button']")
+          )
+            .filter(isVisible)
+            .map((element) => {
+              const control = element as HTMLInputElement | HTMLButtonElement;
+              return cleanText(control.textContent || control.getAttribute("value") || control.getAttribute("aria-label"));
+            })
+            .filter((text) => text.length >= 1);
+
+          const visibleInputs = Array.from(document.querySelectorAll("input, textarea, select"))
+            .filter((element) => {
+              const control = element as HTMLInputElement | HTMLTextAreaElement | HTMLSelectElement;
+              const type = "type" in control ? (control.type ?? "").toLowerCase() : "";
+              return isVisible(element) && !["hidden", "submit", "button", "image"].includes(type);
+            })
+            .map((element) => {
+              const control = element as HTMLInputElement | HTMLTextAreaElement | HTMLSelectElement;
+              const label = control.id ? document.querySelector(`label[for="${control.id}"]`) : null;
+              return {
+                tag: element.tagName.toLowerCase(),
+                type: "type" in control ? control.type ?? "" : "",
+                name: control.getAttribute("name") ?? "",
+                id: control.id ?? "",
+                placeholder: control.getAttribute("placeholder") ?? "",
+                label: cleanText(label?.textContent ?? "")
+              };
+            });
+
+          const radioCount = visibleInputs.filter((input) => input.type.toLowerCase() === "radio").length;
+          const textareaCount = visibleInputs.filter((input) => input.tag === "textarea").length;
+          const selectCount = visibleInputs.filter((input) => input.tag === "select").length;
+          const validatorVisible = visibleInputs.some((input) => {
+            const haystack = cleanText(
+              `${input.name} ${input.id} ${input.placeholder} ${input.label}`
+            ).toLowerCase();
+            return haystack.includes("codificador") || haystack.includes("validator") || haystack.includes("folio");
           });
 
-          for (const control of controls) {
-            const label = control.id ? document.querySelector(`label[for="${control.id}"]`) : null;
-            const fieldset = control.closest("fieldset");
-            const form = control.closest("form");
-            const nearbyText = [
-              label?.textContent ?? "",
-              fieldset?.querySelector("legend")?.textContent ?? "",
-              control.parentElement?.textContent ?? "",
-              form?.textContent ?? ""
-            ]
-              .join(" ")
-              .replace(/\s+/g, " ")
-              .trim();
+          const pageTextPreview = visibleTextNodes.join(" ").slice(0, 3000);
 
-            if (nearbyText.length >= 8) {
-              return nearbyText.slice(0, 300);
-            }
-          }
-
-          for (const selector of textSelectors) {
-            const nodes = Array.from(document.querySelectorAll(selector)).filter(isVisible);
-            for (const node of nodes) {
-              const text = (node.textContent ?? "").replace(/\s+/g, " ").trim();
-              if (text.length >= 12 && /[?:]/.test(text)) {
-                return text.slice(0, 300);
-              }
-            }
-          }
-
-          return null;
+          return {
+            pageTextPreview,
+            visibleInputs,
+            visibleLabels,
+            visibleTextNodes,
+            buttonTexts,
+            radioCount,
+            textareaCount,
+            selectCount,
+            validatorVisible
+          };
         })
-        .catch(() => null);
+        .catch(
+          () =>
+            ({
+              pageTextPreview: "",
+              visibleInputs: [],
+              visibleLabels: [],
+              visibleTextNodes: [],
+              buttonTexts: [],
+              radioCount: 0,
+              textareaCount: 0,
+              selectCount: 0,
+              validatorVisible: false
+            }) as {
+              pageTextPreview: string;
+              visibleInputs: Array<{
+                tag: string;
+                type: string;
+                name: string;
+                id: string;
+                placeholder: string;
+                label: string;
+              }>;
+              visibleLabels: string[];
+              visibleTextNodes: string[];
+              buttonTexts: string[];
+              radioCount: number;
+              textareaCount: number;
+              selectCount: number;
+              validatorVisible: boolean;
+            }
+        )
+        .then((snapshot) => ({
+          frameIndex,
+          frameName: frame.name(),
+          frameUrl: frame.url(),
+          ...snapshot
+        }))
+    )
+  );
 
-      if (question) {
-        return question;
-      }
+  const pageTextPreview = snapshots
+    .map((snapshot) => snapshot.pageTextPreview)
+    .filter(Boolean)
+    .join(" ")
+    .slice(0, 3000);
+  const visibleInputs = snapshots.flatMap((snapshot) => snapshot.visibleInputs);
+  const visibleLabels = snapshots.flatMap((snapshot) => snapshot.visibleLabels);
+  const textCandidates = snapshots.flatMap((snapshot) => snapshot.visibleTextNodes);
+  const probableQuestionText =
+    textCandidates
+      .map((text) => ({ text, score: scoreQuestionCandidate(text) }))
+      .filter((candidate) => candidate.score >= 30)
+      .sort((left, right) => right.score - left.score)[0]?.text ?? null;
+  const visibleQuestions = textCandidates
+    .map((text) => ({ text, score: scoreQuestionCandidate(text) }))
+    .filter((candidate) => candidate.score >= 30)
+    .map((candidate) => candidate.text)
+    .slice(0, 20);
+
+  return {
+    pageTextPreview,
+    frameCount: pageFrames.length,
+    frameUrls: snapshots.map((snapshot) => snapshot.frameUrl),
+    frameNames: snapshots.map((snapshot) => snapshot.frameName),
+    frames: snapshots.map((snapshot) => ({
+      frameIndex: snapshot.frameIndex,
+      frameName: snapshot.frameName,
+      frameUrl: snapshot.frameUrl,
+      textPreview: snapshot.pageTextPreview,
+      radioCount: snapshot.radioCount,
+      textareaCount: snapshot.textareaCount,
+      selectCount: snapshot.selectCount,
+      buttonTexts: snapshot.buttonTexts.slice(0, 20),
+      visibleLabels: Array.from(new Set(snapshot.visibleLabels)).slice(0, 30)
+    })),
+    visibleInputs,
+    visibleLabels: Array.from(new Set(visibleLabels)).slice(0, 50),
+    visibleQuestions,
+    probableQuestionText,
+    radioCount: snapshots.reduce((sum, snapshot) => sum + snapshot.radioCount, 0),
+    textareaCount: snapshots.reduce((sum, snapshot) => sum + snapshot.textareaCount, 0),
+    selectCount: snapshots.reduce((sum, snapshot) => sum + snapshot.selectCount, 0),
+    validatorVisible: snapshots.some((snapshot) => snapshot.validatorVisible)
+  };
+}
+
+async function saveFrameScreenshots(page: Page, outputDir: string, screenshots: string[]) {
+  await saveScreenshot(page, outputDir, "08-main-page.png", screenshots);
+
+  const iframeLocator = page.locator("iframe");
+  const iframeCount = await iframeLocator.count();
+
+  for (let index = 0; index < iframeCount; index += 1) {
+    const fileName = `${String(index + 9).padStart(2, "0")}-frame-${index}.png`;
+    await iframeLocator
+      .nth(index)
+      .screenshot({ path: path.join(outputDir, fileName), type: "png" })
+      .then(() => {
+        screenshots.push(path.join(outputDir, fileName));
+      })
+      .catch(() => undefined);
+  }
+}
+
+async function waitForSurveyContent(page: Page) {
+  const initialSignature = await page
+    .evaluate(() => `${location.href}|${document.body?.innerText.length ?? 0}|${document.body?.children.length ?? 0}`)
+    .catch(() => "");
+
+  for (const delay of [3000, 5000, 8000]) {
+    await page.waitForLoadState("load").catch(() => undefined);
+    await page.waitForTimeout(delay);
+
+    const currentSignature = await page
+      .evaluate(() => `${location.href}|${document.body?.innerText.length ?? 0}|${document.body?.children.length ?? 0}`)
+      .catch(() => "");
+    const snapshot = await inspectSurveyDom(page);
+
+    if (
+      currentSignature !== initialSignature ||
+      !snapshot.validatorVisible ||
+      snapshot.visibleInputs.length > 0 ||
+      snapshot.radioCount > 0 ||
+      snapshot.textareaCount > 0 ||
+      snapshot.selectCount > 0
+    ) {
+      return snapshot;
     }
   }
 
-  throw new Error("No se detectó la primera pregunta después de enviar el validator.");
+  return inspectSurveyDom(page);
 }
 
 async function detectValidatorScreen(page: Page, initialUrl: string) {
@@ -482,6 +693,18 @@ export async function runMinimalSurveyFlow(input: MinimalWorkerInput): Promise<M
   let currentStep = "launch";
   let imageLinks: Array<{ index: number; href: string; text: string }> = [];
   let detectedFirstQuestion = false;
+  let probableQuestionText: string | null = null;
+  let pageTextPreview = "";
+  let frameCount = 0;
+  let frameUrls: string[] = [];
+  let frameNames: string[] = [];
+  let frames: MinimalWorkerResult["frames"] = [];
+  let visibleInputs: MinimalWorkerResult["visibleInputs"] = [];
+  let visibleLabels: string[] = [];
+  let visibleQuestions: string[] = [];
+  let radioCount = 0;
+  let textareaCount = 0;
+  let selectCount = 0;
 
   ensureDir(outputDir);
 
@@ -542,19 +765,50 @@ export async function runMinimalSurveyFlow(input: MinimalWorkerInput): Promise<M
     await continueButton.click({ timeout: 10_000 });
     await saveScreenshot(page, outputDir, "07-after-continue.png", screenshots);
 
-    currentStep = "detecting_first_question";
-    await detectFirstQuestion(page);
-    detectedFirstQuestion = true;
-    await saveScreenshot(page, outputDir, "08-first-question.png", screenshots);
+    currentStep = "waiting_for_survey_content";
+    const surveySnapshot = await waitForSurveyContent(page);
+    await saveFrameScreenshots(page, outputDir, screenshots);
 
-    currentStep = "first_question_detected";
+    pageTextPreview = surveySnapshot.pageTextPreview;
+    frameCount = surveySnapshot.frameCount;
+    frameUrls = surveySnapshot.frameUrls;
+    frameNames = surveySnapshot.frameNames;
+    frames = surveySnapshot.frames;
+    visibleInputs = surveySnapshot.visibleInputs;
+    visibleLabels = surveySnapshot.visibleLabels;
+    visibleQuestions = surveySnapshot.visibleQuestions;
+    probableQuestionText = surveySnapshot.probableQuestionText;
+    radioCount = surveySnapshot.radioCount;
+    textareaCount = surveySnapshot.textareaCount;
+    selectCount = surveySnapshot.selectCount;
+    detectedFirstQuestion =
+      visibleQuestions.length > 0 ||
+      visibleInputs.length > 0 ||
+      radioCount > 0 ||
+      textareaCount > 0 ||
+      selectCount > 0;
+    await saveScreenshot(page, outputDir, "09-dom-state.png", screenshots);
+
+    currentStep = detectedFirstQuestion ? "first_question_detected" : "failed_after_validator_submit";
     return {
-      ok: true,
+      ok: detectedFirstQuestion,
       finalUrl: page.url(),
       title: await page.title().catch(() => ""),
       currentStep,
       imageLinks,
       detectedFirstQuestion,
+      probableQuestionText,
+      pageTextPreview,
+      frameCount,
+      frameUrls,
+      frameNames,
+      frames,
+      visibleInputs,
+      visibleLabels,
+      visibleQuestions,
+      radioCount,
+      textareaCount,
+      selectCount,
       screenshots
     };
   } catch (error) {
@@ -574,6 +828,18 @@ export async function runMinimalSurveyFlow(input: MinimalWorkerInput): Promise<M
       currentStep,
       imageLinks,
       detectedFirstQuestion,
+      probableQuestionText,
+      pageTextPreview,
+      frameCount,
+      frameUrls,
+      frameNames,
+      frames,
+      visibleInputs,
+      visibleLabels,
+      visibleQuestions,
+      radioCount,
+      textareaCount,
+      selectCount,
       screenshots,
       error: error instanceof Error ? error.message : String(error),
       stack: error instanceof Error ? error.stack ?? null : null
