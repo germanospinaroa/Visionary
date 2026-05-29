@@ -264,11 +264,10 @@ async function readInputValue(locator: Locator) {
 }
 
 async function extractVisibleImageLinks(page: Page) {
-  const results = await Promise.all(
+  const anchorResults = await Promise.all(
     page.frames().map(async (frame) => {
       return frame
-        .locator("a[href]")
-        .evaluateAll((elements) => {
+        .evaluate(() => {
           const isVisible = (element: Element) => {
             const node = element as HTMLElement;
             const rect = node.getBoundingClientRect();
@@ -282,37 +281,98 @@ async function extractVisibleImageLinks(page: Page) {
             );
           };
 
-          return elements
+          return Array.from(document.querySelectorAll("a[href]"))
             .map((element) => {
               const anchor = element as HTMLAnchorElement;
+              const rawHref = (anchor.getAttribute("href") ?? "").trim();
               const normalizedText = (anchor.textContent ?? "").replace(/\s+/g, " ").trim();
+              const surroundingText = (
+                anchor.closest("tr")?.textContent ||
+                anchor.closest("table")?.textContent ||
+                anchor.parentElement?.textContent ||
+                ""
+              )
+                .replace(/\s+/g, " ")
+                .trim()
+                .slice(0, 500);
+
               return {
                 visible: isVisible(anchor),
+                rawHref,
                 href: anchor.href.trim(),
-                text: normalizedText
+                text: normalizedText,
+                surroundingText
               };
             })
             .filter((anchor) => {
-              if (!anchor.visible || !anchor.href || anchor.href === "-" || anchor.href.startsWith("javascript:")) {
+              if (
+                !anchor.visible ||
+                !anchor.href ||
+                anchor.rawHref === "-" ||
+                anchor.rawHref.startsWith("javascript:") ||
+                anchor.href.startsWith("javascript:")
+              ) {
                 return false;
               }
 
               const normalizedText = anchor.text.toLowerCase();
+              const normalizedSurroundingText = anchor.surroundingText.toLowerCase();
+              const hrefLooksExternal = /^https?:\/\//i.test(anchor.href);
+              const hrefLooksLikeFileman = /fileman|clobotics|\/api\/file\//i.test(anchor.href);
+
               return (
                 /^\d{1,2}$/.test(anchor.text) ||
                 normalizedText.includes("foto") ||
                 normalizedText.includes("photo") ||
                 normalizedText.includes("imagen") ||
+                normalizedText.startsWith("http://") ||
+                normalizedText.startsWith("https://") ||
+                /^\d{1,2}\s*:/.test(normalizedSurroundingText) ||
+                normalizedSurroundingText.includes("abri los siguientes links") ||
+                normalizedSurroundingText.includes("abrí los siguientes links") ||
+                hrefLooksLikeFileman ||
+                hrefLooksExternal ||
                 /\.(jpg|jpeg|png|gif|bmp|webp)(\?|$)/i.test(anchor.href)
               );
             });
         })
-        .catch(() => [] as Array<{ href: string; text: string }>);
+        .catch(() => [] as Array<{ rawHref: string; href: string; text: string; surroundingText: string }>);
     })
   );
 
-  return results
+  const textResults = await Promise.all(
+    page.frames().map(async (frame) =>
+      frame
+        .evaluate(() => {
+          const bodyText = document.body?.innerText ?? "";
+          return Array.from(bodyText.matchAll(/https?:\/\/[^\s<>"')]+/gi)).map((match) => match[0]);
+        })
+        .catch(() => [] as string[])
+    )
+  );
+
+  const normalizedAnchors = anchorResults
     .flat()
+    .map((anchor) => ({
+      href: anchor.href,
+      text: anchor.text || anchor.surroundingText || anchor.href
+    }));
+
+  const regexAnchors = Array.from(
+    new Set(
+      textResults
+        .flat()
+        .map((href) => href.trim())
+        .filter((href) => /^https?:\/\//i.test(href) && /fileman|clobotics|\/api\/file\//i.test(href))
+    )
+  )
+    .filter((href) => !normalizedAnchors.some((anchor) => anchor.href === href))
+    .map((href) => ({
+      href,
+      text: href
+    }));
+
+  return [...normalizedAnchors, ...regexAnchors]
     .filter((anchor, index, array) => array.findIndex((candidate) => candidate.href === anchor.href) === index)
     .map((anchor, index) => ({
       index: index + 1,
@@ -452,139 +512,212 @@ function scoreQuestionCandidate(text: string) {
 
   if (normalized.length >= 18) score += 30;
   if (normalized.length >= 40) score += 20;
+  if (normalized.length > 1200) score -= 80;
+  if (normalized.length > 700) score -= 30;
   if (/[?:]$/.test(normalized) || normalized.includes("?")) score += 25;
   if (/^\d+[\).\s-]/.test(normalized)) score += 20;
+  if (/^\d+[\).\s-].*¿/.test(normalized)) score += 40;
+  if (/^\d+[\).\s-].*\?$/.test(normalized)) score += 50;
+  if (normalized.includes("no puedo responder")) score -= 10;
+  if (/^si\s*->|^no\s*->/i.test(normalized)) score -= 15;
   if (/[a-záéíóúñ]{4,}/i.test(normalized)) score += 10;
 
   return score;
 }
 
-async function inspectSurveyDom(page: Page): Promise<SurveyDomSnapshot> {
-  const pageFrames = page.frames();
-  const snapshots = await Promise.all(
-    pageFrames.map(async (frame, frameIndex) =>
-      frame
-        .evaluate(() => {
-          const isVisible = (element: Element) => {
-            const node = element as HTMLElement;
-            const rect = node.getBoundingClientRect();
-            const style = window.getComputedStyle(node);
-            return (
-              rect.width > 0 &&
-              rect.height > 0 &&
-              style.display !== "none" &&
-              style.visibility !== "hidden" &&
-              style.opacity !== "0"
-            );
-          };
+function uniqueTexts(values: string[], limit = 20) {
+  return Array.from(new Set(values.map((value) => value.replace(/\s+/g, " ").trim()).filter(Boolean))).slice(0, limit);
+}
 
-          const cleanText = (value: string | null | undefined) =>
-            (value ?? "").replace(/\s+/g, " ").trim();
+function extractQuestionSignalsFromText(rawText: string) {
+  const normalizedText = rawText.replace(/\s+/g, " ").trim();
+  const firstQuestionMatch =
+    normalizedText.match(/\b1[.\-)\s]+(.{20,1200}?\?)/i) ??
+    normalizedText.match(/\b1[.\-)\s]+(.{20,1200}?)(?=\s+NO\s*->|\s+SI\s*->|\s+No puedo responder)/i);
 
-          const visibleTextNodes = Array.from(
-            document.querySelectorAll("h1, h2, h3, h4, legend, label, p, td, th, span, div")
-          )
-            .filter(isVisible)
-            .map((element) => cleanText(element.textContent))
-            .filter((text) => text.length >= 2);
+  const probableQuestionText = firstQuestionMatch
+    ? `1. ${firstQuestionMatch[1].replace(/\s+/g, " ").trim()}`
+    : null;
 
-          const visibleLabels = Array.from(document.querySelectorAll("label, legend"))
-            .filter(isVisible)
-            .map((element) => cleanText(element.textContent))
-            .filter((text) => text.length >= 2);
+  const noOption = normalizedText.match(/NO\s*->\s*(.+?)(?=\s+SI\s*->|\s+No puedo responder|\s+\d+[A-Z]?[.\-)]|\s*$)/i);
+  const siOption = normalizedText.match(/SI\s*->\s*(.+?)(?=\s+No puedo responder|\s+\d+[A-Z]?[.\-)]|\s*$)/i);
+  const noPuedoResponder = normalizedText.match(/No puedo responder(?:\s*\/\s*[^0-9].+?)?(?=\s+\d+[A-Z]?[.\-)]|\s*$)/i);
 
-          const buttonTexts = Array.from(
-            document.querySelectorAll("button, input[type='submit'], input[type='button'], [role='button']")
-          )
-            .filter(isVisible)
-            .map((element) => {
-              const control = element as HTMLInputElement | HTMLButtonElement;
-              return cleanText(control.textContent || control.getAttribute("value") || control.getAttribute("aria-label"));
-            })
-            .filter((text) => text.length >= 1);
-
-          const visibleInputs = Array.from(document.querySelectorAll("input, textarea, select"))
-            .filter((element) => {
-              const control = element as HTMLInputElement | HTMLTextAreaElement | HTMLSelectElement;
-              const type = "type" in control ? (control.type ?? "").toLowerCase() : "";
-              return isVisible(element) && !["hidden", "submit", "button", "image"].includes(type);
-            })
-            .map((element) => {
-              const control = element as HTMLInputElement | HTMLTextAreaElement | HTMLSelectElement;
-              const label = control.id ? document.querySelector(`label[for="${control.id}"]`) : null;
-              return {
-                tag: element.tagName.toLowerCase(),
-                type: "type" in control ? control.type ?? "" : "",
-                name: control.getAttribute("name") ?? "",
-                id: control.id ?? "",
-                placeholder: control.getAttribute("placeholder") ?? "",
-                label: cleanText(label?.textContent ?? "")
-              };
-            });
-
-          const radioCount = visibleInputs.filter((input) => input.type.toLowerCase() === "radio").length;
-          const textareaCount = visibleInputs.filter((input) => input.tag === "textarea").length;
-          const selectCount = visibleInputs.filter((input) => input.tag === "select").length;
-          const validatorVisible = visibleInputs.some((input) => {
-            const haystack = cleanText(
-              `${input.name} ${input.id} ${input.placeholder} ${input.label}`
-            ).toLowerCase();
-            return haystack.includes("codificador") || haystack.includes("validator") || haystack.includes("folio");
-          });
-
-          const pageTextPreview = visibleTextNodes.join(" ").slice(0, 3000);
-
-          return {
-            pageTextPreview,
-            visibleInputs,
-            visibleLabels,
-            visibleTextNodes,
-            buttonTexts,
-            radioCount,
-            textareaCount,
-            selectCount,
-            validatorVisible
-          };
-        })
-        .catch(
-          () =>
-            ({
-              pageTextPreview: "",
-              visibleInputs: [],
-              visibleLabels: [],
-              visibleTextNodes: [],
-              buttonTexts: [],
-              radioCount: 0,
-              textareaCount: 0,
-              selectCount: 0,
-              validatorVisible: false
-            }) as {
-              pageTextPreview: string;
-              visibleInputs: Array<{
-                tag: string;
-                type: string;
-                name: string;
-                id: string;
-                placeholder: string;
-                label: string;
-              }>;
-              visibleLabels: string[];
-              visibleTextNodes: string[];
-              buttonTexts: string[];
-              radioCount: number;
-              textareaCount: number;
-              selectCount: number;
-              validatorVisible: boolean;
-            }
-        )
-        .then((snapshot) => ({
-          frameIndex,
-          frameName: frame.name(),
-          frameUrl: frame.url(),
-          ...snapshot
-        }))
-    )
+  const visibleQuestions = uniqueTexts(
+    [
+      probableQuestionText ?? "",
+      noOption ? `NO -> ${noOption[1].replace(/\s+/g, " ").trim()}` : "",
+      siOption ? `SI -> ${siOption[1].replace(/\s+/g, " ").trim()}` : "",
+      noPuedoResponder ? noPuedoResponder[0].replace(/\s+/g, " ").trim() : ""
+    ],
+    10
   );
+
+  return {
+    probableQuestionText,
+    visibleQuestions
+  };
+}
+
+async function extractBodyTextSignals(page: Page) {
+  const bodyText = await page
+    .evaluate(() => (document.body?.innerText ?? "").replace(/\s+/g, " ").trim())
+    .catch(() => "");
+
+  return {
+    pageTextPreview: bodyText.slice(0, 3000),
+    ...extractQuestionSignalsFromText(bodyText)
+  };
+}
+
+async function inspectSurveyDom(page: Page): Promise<SurveyDomSnapshot> {
+  const evaluateDomSnapshot = () => {
+    const isVisible = (element: Element) => {
+      const node = element as HTMLElement;
+      const rect = node.getBoundingClientRect();
+      const style = window.getComputedStyle(node);
+      return (
+        rect.width > 0 &&
+        rect.height > 0 &&
+        style.display !== "none" &&
+        style.visibility !== "hidden" &&
+        style.opacity !== "0"
+      );
+    };
+
+    const cleanText = (value: string | null | undefined) =>
+      (value ?? "").replace(/\s+/g, " ").trim();
+
+    const getAssociatedLabelText = (control: HTMLInputElement | HTMLTextAreaElement | HTMLSelectElement) => {
+      const nativeLabels = "labels" in control ? Array.from(control.labels ?? []) : [];
+      const explicitLabels =
+        control.id.length > 0
+          ? Array.from(document.querySelectorAll("label[for]")).filter(
+              (label) => (label as HTMLLabelElement).htmlFor === control.id
+            )
+          : [];
+
+      const wrappingLabel = control.closest("label");
+      const labelTexts = [...nativeLabels, ...explicitLabels, ...(wrappingLabel ? [wrappingLabel] : [])]
+        .map((label) => cleanText(label.textContent))
+        .filter(Boolean);
+
+      return labelTexts[0] ?? "";
+    };
+
+    const visibleTextNodes = Array.from(
+      document.querySelectorAll("h1, h2, h3, h4, legend, label, p, td, th, span, div")
+    )
+      .filter(isVisible)
+      .map((element) => cleanText(element.textContent))
+      .filter((text) => text.length >= 2);
+
+    const questionBlocks = Array.from(document.querySelectorAll("th, td, legend, p, div, span"))
+      .filter(isVisible)
+      .map((element) => cleanText(element.textContent))
+      .filter((text) => text.length >= 2 && text.length <= 1400);
+
+    const visibleLabels = Array.from(document.querySelectorAll("label, legend"))
+      .filter(isVisible)
+      .map((element) => cleanText(element.textContent))
+      .filter((text) => text.length >= 2);
+
+    const buttonTexts = Array.from(
+      document.querySelectorAll("button, input[type='submit'], input[type='button'], [role='button']")
+    )
+      .filter(isVisible)
+      .map((element) => {
+        const control = element as HTMLInputElement | HTMLButtonElement;
+        return cleanText(control.textContent || control.getAttribute("value") || control.getAttribute("aria-label"));
+      })
+      .filter((text) => text.length >= 1);
+
+    const visibleInputs = Array.from(document.querySelectorAll("input, textarea, select"))
+      .filter((element) => {
+        const control = element as HTMLInputElement | HTMLTextAreaElement | HTMLSelectElement;
+        const type = "type" in control ? (control.type ?? "").toLowerCase() : "";
+        return isVisible(element) && !["hidden", "submit", "button", "image"].includes(type);
+      })
+      .map((element) => {
+        const control = element as HTMLInputElement | HTMLTextAreaElement | HTMLSelectElement;
+        return {
+          tag: element.tagName.toLowerCase(),
+          type: "type" in control ? control.type ?? "" : "",
+          name: control.getAttribute("name") ?? "",
+          id: control.id ?? "",
+          placeholder: control.getAttribute("placeholder") ?? "",
+          label: getAssociatedLabelText(control)
+        };
+      });
+
+    const radioCount = visibleInputs.filter((input) => input.type.toLowerCase() === "radio").length;
+    const textareaCount = visibleInputs.filter((input) => input.tag === "textarea").length;
+    const selectCount = visibleInputs.filter((input) => input.tag === "select").length;
+    const validatorVisible = visibleInputs.some((input) => {
+      const haystack = cleanText(`${input.name} ${input.id} ${input.placeholder} ${input.label}`).toLowerCase();
+      return haystack.includes("codificador") || haystack.includes("validator") || haystack.includes("folio");
+    });
+
+    const pageTextPreview = visibleTextNodes.join(" ").slice(0, 3000);
+
+    return {
+      pageTextPreview,
+      visibleInputs,
+      visibleLabels,
+      visibleTextNodes,
+      questionBlocks,
+      buttonTexts,
+      radioCount,
+      textareaCount,
+      selectCount,
+      validatorVisible
+    };
+  };
+
+  const emptySnapshot = {
+    pageTextPreview: "",
+    visibleInputs: [] as Array<{
+      tag: string;
+      type: string;
+      name: string;
+      id: string;
+      placeholder: string;
+      label: string;
+    }>,
+    visibleLabels: [] as string[],
+    visibleTextNodes: [] as string[],
+    questionBlocks: [] as string[],
+    buttonTexts: [] as string[],
+    radioCount: 0,
+    textareaCount: 0,
+    selectCount: 0,
+    validatorVisible: false
+  };
+
+  const mainSnapshot = await page.evaluate(evaluateDomSnapshot).catch(() => emptySnapshot);
+  const childFrames = page.frames().slice(1);
+  const childSnapshots = await Promise.all(
+    childFrames.map(async (frame, childIndex) => {
+      const snapshot = await frame.evaluate(evaluateDomSnapshot).catch(() => emptySnapshot);
+      return {
+        frameIndex: childIndex + 1,
+        frameName: frame.name(),
+        frameUrl: frame.url(),
+        ...snapshot
+      };
+    })
+  );
+
+  const snapshots = [
+    {
+      frameIndex: 0,
+      frameName: page.mainFrame().name(),
+      frameUrl: page.url(),
+      ...mainSnapshot
+    },
+    ...childSnapshots
+  ];
+  const pageFrames = page.frames();
 
   const pageTextPreview = snapshots
     .map((snapshot) => snapshot.pageTextPreview)
@@ -594,16 +727,40 @@ async function inspectSurveyDom(page: Page): Promise<SurveyDomSnapshot> {
   const visibleInputs = snapshots.flatMap((snapshot) => snapshot.visibleInputs);
   const visibleLabels = snapshots.flatMap((snapshot) => snapshot.visibleLabels);
   const textCandidates = snapshots.flatMap((snapshot) => snapshot.visibleTextNodes);
+  const questionCandidates = snapshots.flatMap((snapshot) => snapshot.questionBlocks);
+  const fullBodyText = pageTextPreview.replace(/\s+/g, " ").trim();
+  const rankedQuestionCandidates = uniqueTexts(questionCandidates, 100)
+    .map((text) => ({ text, score: scoreQuestionCandidate(text) }))
+    .filter((candidate) => candidate.score >= 30)
+    .sort((left, right) => right.score - left.score);
+
   const probableQuestionText =
+    rankedQuestionCandidates
+      .find((candidate) => /^\d+[\).\s-]/.test(candidate.text) && candidate.text.includes("?"))
+      ?.text ??
+    rankedQuestionCandidates
+      .find((candidate) => candidate.text.includes("?"))
+      ?.text ??
+    fullBodyText.match(/\d+[\).\s-].{20,600}?\?/i)?.[0]?.trim() ??
     textCandidates
       .map((text) => ({ text, score: scoreQuestionCandidate(text) }))
       .filter((candidate) => candidate.score >= 30)
       .sort((left, right) => right.score - left.score)[0]?.text ?? null;
-  const visibleQuestions = textCandidates
-    .map((text) => ({ text, score: scoreQuestionCandidate(text) }))
-    .filter((candidate) => candidate.score >= 30)
-    .map((candidate) => candidate.text)
-    .slice(0, 20);
+
+  const optionCandidates = uniqueTexts(
+    questionCandidates.filter((text) => /^si\s*->|^no\s*->|^no puedo responder$/i.test(text)),
+    10
+  );
+
+  const visibleQuestions = uniqueTexts(
+    [
+      ...rankedQuestionCandidates
+        .filter((candidate) => /^\d+[\).\s-]/.test(candidate.text) || candidate.text.includes("?"))
+        .map((candidate) => candidate.text),
+      ...optionCandidates
+    ],
+    20
+  );
 
   return {
     pageTextPreview,
@@ -941,6 +1098,15 @@ export async function runMinimalSurveyFlow(input: MinimalWorkerInput): Promise<M
     probableQuestionText = surveySnapshot.probableQuestionText;
     textareaCount = surveySnapshot.textareaCount;
     selectCount = surveySnapshot.selectCount;
+
+    if (!pageTextPreview || !probableQuestionText || visibleQuestions.length === 0) {
+      const fallbackSignals = await extractBodyTextSignals(page);
+      pageTextPreview = fallbackSignals.pageTextPreview || pageTextPreview;
+      probableQuestionText = fallbackSignals.probableQuestionText ?? probableQuestionText;
+      visibleQuestions =
+        fallbackSignals.visibleQuestions.length > 0 ? fallbackSignals.visibleQuestions : visibleQuestions;
+    }
+
     detectedFirstQuestion =
       radioCount > 0 ||
       finalBodyTextLength > 500 ||
