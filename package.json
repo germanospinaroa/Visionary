@@ -12,6 +12,7 @@
     "supabase:validate": "node scripts/validate-supabase.mjs",
     "pilot:worker": "tsx scripts/run-pilot-worker.ts",
     "pilot:service": "tsx worker-service/server.ts",
+    "minimal:worker": "tsx worker-service/minimal-server.ts",
     "pilot:service:health": "node scripts/check-worker-health.mjs"
   },
   "dependencies": {
