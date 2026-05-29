@@ -24,6 +24,10 @@ type MinimalWorkerResult = {
   frameCount: number;
   frameUrls: string[];
   frameNames: string[];
+  pollingIterations: number;
+  firstQuestionDetectedAtSecond: number | null;
+  finalBodyTextLength: number;
+  finalLabelCount: number;
   frames: Array<{
     frameIndex: number;
     frameName: string;
@@ -48,6 +52,14 @@ type MinimalWorkerResult = {
   radioCount: number;
   textareaCount: number;
   selectCount: number;
+  pollingDebug: Array<{
+    second: number;
+    bodyTextLength: number;
+    radioCount: number;
+    labelCount: number;
+    formCount: number;
+    tableCount: number;
+  }>;
   screenshots: string[];
   error?: string;
   stack?: string | null;
@@ -240,6 +252,15 @@ async function findBestValidatorInput(page: Page) {
 async function fillInput(locator: Locator, value: string) {
   await locator.click({ timeout: 10_000 });
   await locator.fill(value, { timeout: 10_000 });
+}
+
+async function readInputValue(locator: Locator) {
+  return locator
+    .evaluate((element) => {
+      const control = element as HTMLInputElement | HTMLTextAreaElement | HTMLSelectElement;
+      return "value" in control ? control.value ?? "" : "";
+    })
+    .catch(() => "");
 }
 
 async function extractVisibleImageLinks(page: Page) {
@@ -629,6 +650,103 @@ async function saveFrameScreenshots(page: Page, outputDir: string, screenshots: 
   }
 }
 
+type PollingSnapshot = {
+  bodyTextLength: number;
+  radioCount: number;
+  labelCount: number;
+  formCount: number;
+  tableCount: number;
+  containsSi: boolean;
+  containsNo: boolean;
+  containsNoPuedoResponder: boolean;
+};
+
+async function pollForClassicAspQuestion(page: Page, outputDir: string, screenshots: string[]) {
+  await page.waitForLoadState("load").catch(() => undefined);
+  await page.waitForLoadState("domcontentloaded").catch(() => undefined);
+  await page.waitForLoadState("networkidle").catch(() => undefined);
+
+  const pollingDebug: MinimalWorkerResult["pollingDebug"] = [];
+  let detectedAtSecond: number | null = null;
+  let finalSnapshot: PollingSnapshot = {
+    bodyTextLength: 0,
+    radioCount: 0,
+    labelCount: 0,
+    formCount: 0,
+    tableCount: 0,
+    containsSi: false,
+    containsNo: false,
+    containsNoPuedoResponder: false
+  };
+
+  for (let second = 1; second <= 30; second += 1) {
+    await page.waitForTimeout(1000);
+    const snapshot = await page
+      .evaluate(() => {
+        const bodyText = (document.body?.innerText ?? "").replace(/\s+/g, " ").trim();
+        const normalized = bodyText.toLowerCase();
+        return {
+          bodyTextLength: bodyText.length,
+          radioCount: document.querySelectorAll("input[type='radio']").length,
+          labelCount: document.querySelectorAll("label").length,
+          formCount: document.querySelectorAll("form").length,
+          tableCount: document.querySelectorAll("table").length,
+          containsSi: /\bsi\b/i.test(bodyText),
+          containsNo: /\bno\b/i.test(bodyText),
+          containsNoPuedoResponder: normalized.includes("no puedo responder")
+        };
+      })
+      .catch(
+        () =>
+          ({
+            bodyTextLength: 0,
+            radioCount: 0,
+            labelCount: 0,
+            formCount: 0,
+            tableCount: 0,
+            containsSi: false,
+            containsNo: false,
+            containsNoPuedoResponder: false
+          }) satisfies PollingSnapshot
+      );
+
+    finalSnapshot = snapshot;
+    pollingDebug.push({
+      second,
+      bodyTextLength: snapshot.bodyTextLength,
+      radioCount: snapshot.radioCount,
+      labelCount: snapshot.labelCount,
+      formCount: snapshot.formCount,
+      tableCount: snapshot.tableCount
+    });
+
+    await saveScreenshot(
+      page,
+      outputDir,
+      `${String(second + 7).padStart(2, "0")}-wait-${second}.png`,
+      screenshots
+    );
+
+    if (
+      snapshot.radioCount > 0 ||
+      snapshot.bodyTextLength > 500 ||
+      snapshot.containsSi ||
+      snapshot.containsNo ||
+      snapshot.containsNoPuedoResponder
+    ) {
+      detectedAtSecond = second;
+      break;
+    }
+  }
+
+  return {
+    pollingIterations: pollingDebug.length,
+    firstQuestionDetectedAtSecond: detectedAtSecond,
+    finalSnapshot,
+    pollingDebug
+  };
+}
+
 async function waitForSurveyContent(page: Page) {
   const initialSignature = await page
     .evaluate(() => `${location.href}|${document.body?.innerText.length ?? 0}|${document.body?.children.length ?? 0}`)
@@ -698,6 +816,9 @@ export async function runMinimalSurveyFlow(input: MinimalWorkerInput): Promise<M
   let frameCount = 0;
   let frameUrls: string[] = [];
   let frameNames: string[] = [];
+  let pollingIterations = 0;
+  let firstQuestionDetectedAtSecond: number | null = null;
+  let finalBodyTextLength = 0;
   let frames: MinimalWorkerResult["frames"] = [];
   let visibleInputs: MinimalWorkerResult["visibleInputs"] = [];
   let visibleLabels: string[] = [];
@@ -705,6 +826,13 @@ export async function runMinimalSurveyFlow(input: MinimalWorkerInput): Promise<M
   let radioCount = 0;
   let textareaCount = 0;
   let selectCount = 0;
+  let pollingDebug: MinimalWorkerResult["pollingDebug"] = [];
+  const runtimeState: { modalMessage: string | null } = { modalMessage: null };
+
+  page.on("dialog", async (dialog) => {
+    runtimeState.modalMessage = dialog.message();
+    await dialog.dismiss().catch(() => undefined);
+  });
 
   ensureDir(outputDir);
 
@@ -746,8 +874,17 @@ export async function runMinimalSurveyFlow(input: MinimalWorkerInput): Promise<M
       throw new Error(`El input de validator dejó de ser visible: ${validatorScreen.validatorInput.selector}`);
     }
 
+    await saveScreenshot(page, outputDir, "validator-before-fill.png", screenshots);
     await fillInput(validatorLocator, input.validatorCode);
+    await saveScreenshot(page, outputDir, "validator-after-fill.png", screenshots);
     await saveScreenshot(page, outputDir, "05-validator-code-filled.png", screenshots);
+
+    currentStep = "confirming_validator_code";
+    const validatorValueAfterFill = await readInputValue(validatorLocator);
+    if (validatorValueAfterFill !== input.validatorCode) {
+      await saveScreenshot(page, outputDir, "validator-not-written.png", screenshots);
+      throw new Error("validator_code_not_written");
+    }
 
     currentStep = "detecting_image_links";
     imageLinks = await extractVisibleImageLinks(page);
@@ -756,6 +893,14 @@ export async function runMinimalSurveyFlow(input: MinimalWorkerInput): Promise<M
     currentStep = "checking_image_links";
     await verifyImageLinks(context, imageLinks);
 
+    currentStep = "reconfirming_validator_code";
+    const validatorValueBeforeContinue = await readInputValue(validatorLocator);
+    await saveScreenshot(page, outputDir, "validator-before-continue.png", screenshots);
+    if (validatorValueBeforeContinue !== input.validatorCode) {
+      await saveScreenshot(page, outputDir, "validator-not-written.png", screenshots);
+      throw new Error("validator_code_not_written");
+    }
+
     currentStep = "clicking_continue";
     const continueButton = await findContinueButton(page);
     if (!continueButton) {
@@ -763,10 +908,26 @@ export async function runMinimalSurveyFlow(input: MinimalWorkerInput): Promise<M
     }
 
     await continueButton.click({ timeout: 10_000 });
+    await page.waitForTimeout(1000);
+    const normalizedModalMessage =
+      typeof runtimeState.modalMessage === "string" ? runtimeState.modalMessage.toLowerCase() : "";
+    if (normalizedModalMessage.includes("por favor conteste la pregunta")) {
+      currentStep = "validator_required_modal";
+      await saveScreenshot(page, outputDir, "validator-required-modal.png", screenshots);
+      throw new Error("validator_required_modal");
+    }
     await saveScreenshot(page, outputDir, "07-after-continue.png", screenshots);
 
     currentStep = "waiting_for_survey_content";
-    const surveySnapshot = await waitForSurveyContent(page);
+    const pollingResult = await pollForClassicAspQuestion(page, outputDir, screenshots);
+    pollingIterations = pollingResult.pollingIterations;
+    firstQuestionDetectedAtSecond = pollingResult.firstQuestionDetectedAtSecond;
+    finalBodyTextLength = pollingResult.finalSnapshot.bodyTextLength;
+    pollingDebug = pollingResult.pollingDebug;
+    radioCount = pollingResult.finalSnapshot.radioCount;
+    const finalLabelCount = pollingResult.finalSnapshot.labelCount;
+
+    const surveySnapshot = await inspectSurveyDom(page);
     await saveFrameScreenshots(page, outputDir, screenshots);
 
     pageTextPreview = surveySnapshot.pageTextPreview;
@@ -778,16 +939,14 @@ export async function runMinimalSurveyFlow(input: MinimalWorkerInput): Promise<M
     visibleLabels = surveySnapshot.visibleLabels;
     visibleQuestions = surveySnapshot.visibleQuestions;
     probableQuestionText = surveySnapshot.probableQuestionText;
-    radioCount = surveySnapshot.radioCount;
     textareaCount = surveySnapshot.textareaCount;
     selectCount = surveySnapshot.selectCount;
     detectedFirstQuestion =
-      visibleQuestions.length > 0 ||
-      visibleInputs.length > 0 ||
       radioCount > 0 ||
-      textareaCount > 0 ||
-      selectCount > 0;
-    await saveScreenshot(page, outputDir, "09-dom-state.png", screenshots);
+      finalBodyTextLength > 500 ||
+      probableQuestionText !== null ||
+      visibleQuestions.some((text) => /(^|\b)(si|no)(\b|$)/i.test(text)) ||
+      pageTextPreview.toLowerCase().includes("no puedo responder");
 
     currentStep = detectedFirstQuestion ? "first_question_detected" : "failed_after_validator_submit";
     return {
@@ -802,19 +961,25 @@ export async function runMinimalSurveyFlow(input: MinimalWorkerInput): Promise<M
       frameCount,
       frameUrls,
       frameNames,
+      pollingIterations,
+      firstQuestionDetectedAtSecond,
+      finalBodyTextLength,
       frames,
       visibleInputs,
       visibleLabels,
       visibleQuestions,
       radioCount,
+      finalLabelCount,
       textareaCount,
       selectCount,
+      pollingDebug,
       screenshots
     };
   } catch (error) {
     await saveScreenshot(page, outputDir, "99-fatal-error.png", screenshots).catch(() => undefined);
     if (
       currentStep === "checking_image_links" ||
+      currentStep === "reconfirming_validator_code" ||
       currentStep === "clicking_continue" ||
       currentStep === "detecting_first_question"
     ) {
@@ -833,13 +998,18 @@ export async function runMinimalSurveyFlow(input: MinimalWorkerInput): Promise<M
       frameCount,
       frameUrls,
       frameNames,
+      pollingIterations,
+      firstQuestionDetectedAtSecond,
+      finalBodyTextLength,
       frames,
       visibleInputs,
       visibleLabels,
       visibleQuestions,
       radioCount,
+      finalLabelCount: visibleLabels.length,
       textareaCount,
       selectCount,
+      pollingDebug,
       screenshots,
       error: error instanceof Error ? error.message : String(error),
       stack: error instanceof Error ? error.stack ?? null : null
