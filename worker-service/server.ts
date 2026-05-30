@@ -6,7 +6,12 @@ import { loadEnvConfig } from "@next/env";
 import { createSupabaseAdminClient } from "@/lib/supabase/admin";
 import { getOpenAIClient } from "@/lib/openai";
 import { createBrowserEvent, getSurveyRunDetails, updateSurveyRun } from "@/lib/pilot/db";
-import { runMinimalSurveyFlow } from "@/lib/pilot/minimal-worker";
+import {
+  runMinimalSurveyFlow,
+  runSurveyAnsweringUntilPhotoSelection,
+  runSurveyCompletionWithTraceability,
+  submitPreparedSurveyConfirmation
+} from "@/lib/pilot/minimal-worker";
 import { diagnosePilotRunScreen, runPilotSurvey } from "@/lib/pilot/worker";
 
 const port = Number(process.env.PILOT_WORKER_API_PORT ?? process.env.PORT ?? 4001);
@@ -27,6 +32,27 @@ type ActiveRun = {
 
 const activeRuns = new Map<string, ActiveRun>();
 const allowedOrigin = "https://visual-validator-mvp.vercel.app";
+
+type MinimalQuestionResultPayload = {
+  id?: number;
+  questionId?: number;
+  physicalNumber?: string;
+  text?: string;
+  referenceImageUrl?: string;
+  expectedOptions?: string[];
+  status?: "pending" | "analyzing" | "answered" | "needs_review";
+  suggestedAnswer?: string;
+  storePhotosUsed?: number[];
+};
+
+type MinimalRunRequestBody = {
+  surveyUrl?: string;
+  storeCode?: string;
+  validatorCode?: string;
+  questionResults?: MinimalQuestionResultPayload[];
+  needsReviewBehavior?: "stop" | "select_no_puedo_responder";
+  preparedSessionId?: string;
+};
 
 function log(level: "info" | "warn" | "error", message: string, extra?: Record<string, unknown>) {
   const payload = {
@@ -360,7 +386,7 @@ async function handleDiagnoseRun(runId: string, response: ServerResponse) {
 }
 
 async function handleMinimalRunStart(request: IncomingMessage, response: ServerResponse) {
-  const body = await readJsonBody(request);
+  const body = (await readJsonBody(request)) as MinimalRunRequestBody;
   const surveyUrl = typeof body.surveyUrl === "string" ? body.surveyUrl.trim() : "";
   const storeCode = typeof body.storeCode === "string" ? body.storeCode.trim() : "";
   const validatorCode = typeof body.validatorCode === "string" ? body.validatorCode.trim() : "";
@@ -408,6 +434,132 @@ async function handleMinimalRunStart(request: IncomingMessage, response: ServerR
       detectedFirstQuestion: result.detectedFirstQuestion,
       radioCount: result.radioCount,
       finalBodyTextLength: result.finalBodyTextLength
+    }
+  });
+}
+
+function normalizeQuestionResults(questionResults: MinimalQuestionResultPayload[] = []) {
+  return questionResults.map((question, index) => ({
+    id:
+      typeof question.id === "number"
+        ? question.id
+        : typeof question.questionId === "number"
+          ? question.questionId
+          : index + 1,
+    physicalNumber: question.physicalNumber?.trim() ?? "",
+    text: question.text?.trim() ?? "",
+    referenceImageUrl: question.referenceImageUrl?.trim() ?? "",
+    expectedOptions: question.expectedOptions ?? ["SI", "NO", "No puedo responder"],
+    status: question.status ?? "pending",
+    suggestedAnswer: question.suggestedAnswer?.trim() ?? "No puedo responder",
+    storePhotosUsed: Array.isArray(question.storePhotosUsed) ? question.storePhotosUsed : []
+  }));
+}
+
+async function handleMinimalSurveyAction(
+  request: IncomingMessage,
+  response: ServerResponse,
+  action: "answer-until-photo" | "complete-survey-trace" | "submit-confirmed-survey"
+) {
+  const body = (await readJsonBody(request)) as MinimalRunRequestBody;
+
+  if (action === "submit-confirmed-survey") {
+    const preparedSessionId = body.preparedSessionId?.trim() ?? "";
+
+    log("info", "Minimal submit confirmation payload received.", {
+      path: "/minimal-runs/submit-confirmed-survey",
+      origin: request.headers.origin ?? null,
+      preparedSessionId
+    });
+
+    if (!preparedSessionId) {
+      const payload = {
+        ok: false,
+        error: "missing_prepared_session_id",
+        detail: "preparedSessionId es obligatorio."
+      };
+      writeJson(response, 400, payload);
+      log("warn", "Request completed.", {
+        method: "POST",
+        path: "/minimal-runs/submit-confirmed-survey",
+        status: 400,
+        body: payload
+      });
+      return;
+    }
+
+    const result = await submitPreparedSurveyConfirmation(preparedSessionId);
+    writeJson(response, result.ok ? 200 : 500, result);
+    log(result.ok ? "info" : "warn", "Request completed.", {
+      method: "POST",
+      path: "/minimal-runs/submit-confirmed-survey",
+      status: result.ok ? 200 : 500,
+      body: {
+        ok: result.ok,
+        finalState: result.finalState,
+        surveyCompletionNumber: result.surveyCompletionNumber ?? null,
+        preparedSessionId: result.preparedSessionId ?? null
+      }
+    });
+    return;
+  }
+
+  const surveyUrl = body.surveyUrl?.trim() ?? "";
+  const storeCode = body.storeCode?.trim() ?? "";
+  const validatorCode = body.validatorCode?.trim() ?? "";
+
+  log("info", "Minimal survey action payload received.", {
+    path: action === "complete-survey-trace" ? "/minimal-runs/complete-survey-trace" : "/minimal-runs/answer-until-photo",
+    origin: request.headers.origin ?? null,
+    body: {
+      surveyUrl,
+      storeCode,
+      validatorCode,
+      questionResultsCount: body.questionResults?.length ?? 0,
+      needsReviewBehavior: body.needsReviewBehavior ?? "stop"
+    }
+  });
+
+  if (!surveyUrl || !storeCode || !validatorCode) {
+    const payload = {
+      ok: false,
+      error: "missing_required_fields",
+      detail: "surveyUrl, storeCode y validatorCode son obligatorios."
+    };
+    writeJson(response, 400, payload);
+    log("warn", "Request completed.", {
+      method: "POST",
+      path: action === "complete-survey-trace" ? "/minimal-runs/complete-survey-trace" : "/minimal-runs/answer-until-photo",
+      status: 400,
+      body: payload
+    });
+    return;
+  }
+
+  const params = {
+    surveyUrl,
+    storeCode,
+    validatorCode,
+    questionResults: normalizeQuestionResults(body.questionResults),
+    needsReviewBehavior: body.needsReviewBehavior ?? "stop"
+  };
+
+  const result =
+    action === "complete-survey-trace"
+      ? await runSurveyCompletionWithTraceability(params)
+      : await runSurveyAnsweringUntilPhotoSelection(params);
+
+  writeJson(response, 200, result);
+  log(result.ok ? "info" : "warn", "Request completed.", {
+    method: "POST",
+    path: action === "complete-survey-trace" ? "/minimal-runs/complete-survey-trace" : "/minimal-runs/answer-until-photo",
+    status: 200,
+    body: {
+      ok: result.ok,
+      finalState: result.finalState,
+      currentStep: result.currentStep,
+      screenshots: result.screenshots.length,
+      preparedSessionId: result.preparedSessionId ?? null
     }
   });
 }
@@ -502,6 +654,21 @@ const server = createServer(async (request, response) => {
 
     if (method === "POST" && url.pathname === "/minimal-runs/start") {
       await handleMinimalRunStart(request, response);
+      return;
+    }
+
+    if (method === "POST" && url.pathname === "/minimal-runs/answer-until-photo") {
+      await handleMinimalSurveyAction(request, response, "answer-until-photo");
+      return;
+    }
+
+    if (method === "POST" && url.pathname === "/minimal-runs/complete-survey-trace") {
+      await handleMinimalSurveyAction(request, response, "complete-survey-trace");
+      return;
+    }
+
+    if (method === "POST" && url.pathname === "/minimal-runs/submit-confirmed-survey") {
+      await handleMinimalSurveyAction(request, response, "submit-confirmed-survey");
       return;
     }
 
