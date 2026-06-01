@@ -352,6 +352,50 @@ const DEFAULT_GENERAL_INSTRUCTIONS = [
   "- Si la evidencia no alcanza, mantener PENDIENTE_ANALISIS_VISUAL."
 ].join("\n");
 
+function buildEmptyVisualDiagnostic() {
+  return {
+    whatTheQuestionAsks: "",
+    requiredEvidence: [] as string[],
+    evidenceFound: [] as string[],
+    evidenceMissing: [] as string[],
+    visualComparisonWithReference: "",
+    decisionRuleApplied: ""
+  };
+}
+
+function buildEmptyKnowledgeBase(): KnowledgeBase {
+  return {
+    summary: "",
+    brandsDetected: [],
+    productsDetected: [],
+    productsAbsent: [],
+    categoriesDetected: [],
+    sectionsDetected: [],
+    orderingDetected: [],
+    shelfLocations: [],
+    signageDetected: [],
+    visiblePrices: [],
+    promotionsDetected: [],
+    facingDisplaySignals: [],
+    relevantVisualSignals: [],
+    uncertainties: [],
+    crossQuestionInsights: []
+  };
+}
+
+function resetQuestionVisualResult(question: ProjectQuestion): ProjectQuestion {
+  return {
+    ...question,
+    status: "pending",
+    suggestedAnswer: "PENDIENTE_ANALISIS_VISUAL",
+    confidence: 0,
+    reasoning: "El analisis visual real aun no fue ejecutado.",
+    storePhotosUsed: [],
+    evidence: [],
+    visualDiagnostic: buildEmptyVisualDiagnostic()
+  };
+}
+
 function buildEmptyQuestion(id: number): ProjectQuestion {
   return {
     id,
@@ -368,14 +412,7 @@ function buildEmptyQuestion(id: number): ProjectQuestion {
     reasoning: "El analisis visual real aun no fue ejecutado.",
     storePhotosUsed: [],
     evidence: [],
-    visualDiagnostic: {
-      whatTheQuestionAsks: "",
-      requiredEvidence: [],
-      evidenceFound: [],
-      evidenceMissing: [],
-      visualComparisonWithReference: "",
-      decisionRuleApplied: ""
-    }
+    visualDiagnostic: buildEmptyVisualDiagnostic()
   };
 }
 
@@ -2319,8 +2356,10 @@ export function NewAuditWorkspace() {
     initialPerPhotoAnalysis: PerPhotoAnalysis[];
     startBatchIndex: number;
     questionUnderstanding: VisualQuestionUnderstanding[];
+    initialWorkingQuestions: ProjectQuestion[];
+    initialBatchStates: VisualBatchState[];
   }) {
-    const workingQuestions = [...projectQuestions];
+    const workingQuestions = [...input.initialWorkingQuestions];
     let workingKnowledgeBase = { ...input.initialKnowledgeBase };
     const batchSize = chooseQuestionBatchSize({
       questionCount: input.serializedQuestions.length,
@@ -2328,15 +2367,7 @@ export function NewAuditWorkspace() {
       generalInstructions
     });
     const chunks = splitIntoChunks(input.serializedQuestions, batchSize);
-    let nextBatchStates = visualPipelineState.batchStates.length
-      ? [...visualPipelineState.batchStates]
-      : chunks.map((chunk, index) => ({
-          batchNumber: index + 1,
-          totalBatches: chunks.length,
-          questionIds: chunk.map((question) => question.id),
-          status: "pending" as VisualBatchStatus,
-          error: null
-        }));
+    let nextBatchStates = input.initialBatchStates.map((batch) => ({ ...batch }));
 
     setVisualPipelineState((current) => ({
       ...current,
@@ -2630,6 +2661,10 @@ export function NewAuditWorkspace() {
     setVisualAnalyzing(true);
     setVisualAnalysisMessage("Analizando visualmente...");
     setPreviewError(null);
+    setVisualAnalysisLogs([]);
+    setVisualPipelineState(createEmptyPipelineState());
+    setPerPhotoAnalysis([]);
+    setKnowledgeBase(buildEmptyKnowledgeBase());
     pushVisualLog("iniciando análisis visual", { source });
     pushVisualLog("fotos disponibles", {
       count: imageLinks.length,
@@ -2643,19 +2678,16 @@ export function NewAuditWorkspace() {
       questionIds: activeProjectQuestions.map((question) => question.id),
       questionCount: activeProjectQuestions.length
     });
-    setProjectQuestions((current) =>
-      current.map((question) => ({
-        ...question,
-        status: activeProjectQuestions.some((item) => item.id === question.id) ? "analyzing" : question.status
-      }))
-    );
-
     let analyzeStatus: number | null = null;
     let analyzeBody: unknown = null;
     let analyzeRawText = "";
     let payloadSizeBytes = 0;
 
     try {
+      const cleanedProjectQuestions = projectQuestions.map((question) =>
+        activeProjectQuestions.some((item) => item.id === question.id) ? resetQuestionVisualResult(question) : question
+      );
+      setProjectQuestions(cleanedProjectQuestions);
       const serializedQuestions = await serializeVisualQuestions(activeProjectQuestions);
       serializedQuestionsRef.current = serializedQuestions;
       const questionBankHash = buildQuestionBankHash(activeProjectQuestions);
@@ -2673,18 +2705,19 @@ export function NewAuditWorkspace() {
         generalInstructions
       });
       const chunks = splitIntoChunks(serializedQuestions, batchSize);
+      const initialBatchStates = chunks.map((chunk, index) => ({
+        batchNumber: index + 1,
+        totalBatches: chunks.length,
+        questionIds: chunk.map((question) => question.id),
+        status: "pending" as VisualBatchStatus,
+        error: null
+      }));
 
       setVisualPipelineState({
         storePreScan: "running",
         knowledgeBaseMerge: "pending",
         finalReview: "pending",
-        batchStates: chunks.map((chunk, index) => ({
-          batchNumber: index + 1,
-          totalBatches: chunks.length,
-          questionIds: chunk.map((question) => question.id),
-          status: "pending",
-          error: null
-        })),
+        batchStates: initialBatchStates,
         answeredCount: 0,
         needsReviewCount: 0,
         pendingCount: serializedQuestions.length,
@@ -2797,8 +2830,28 @@ export function NewAuditWorkspace() {
         timestamp: new Date().toISOString()
       });
       const phaseCStartedAt = Date.now();
+      const activeQuestionIds = serializedQuestions.map((question) => question.id);
+      const questionUnderstandingIds = phaseAResult.questionUnderstanding.map((question) => question.questionId);
+      const previousResultIds = projectQuestions
+        .filter(
+          (question) =>
+            activeQuestionIds.includes(question.id) &&
+            (question.status === "answered" || question.status === "needs_review") &&
+            question.suggestedAnswer &&
+            question.suggestedAnswer !== "PENDIENTE_ANALISIS_VISUAL"
+        )
+        .map((question) => question.id);
+      const answerPayloadQuestionIds = phaseAResult.questionUnderstanding
+        .filter((question) => activeQuestionIds.includes(question.questionId))
+        .map((question) => question.questionId);
+      pushVisualLog("PHASE_C_INPUT_IDS", {
+        activeQuestionIds,
+        questionUnderstandingIds,
+        previousResultIds,
+        answerPayloadQuestionIds
+      });
       pushVisualLog("PHASE_C_ANSWERS_STARTED", {
-        questionIds: serializedQuestions.map((question) => question.id),
+        questionIds: activeQuestionIds,
         questionCount: serializedQuestions.length,
         timestamp: new Date().toISOString()
       });
@@ -2808,7 +2861,9 @@ export function NewAuditWorkspace() {
         initialKnowledgeBase,
         initialPerPhotoAnalysis: storeResult.parsed.perPhotoAnalysis,
         startBatchIndex: 0,
-        questionUnderstanding: phaseAResult.questionUnderstanding
+        questionUnderstanding: phaseAResult.questionUnderstanding,
+        initialWorkingQuestions: cleanedProjectQuestions,
+        initialBatchStates
       });
       pushVisualLog("PHASE_C_ANSWERS_COMPLETED", {
         answeredQuestionIds: phaseCResult.workingQuestions
