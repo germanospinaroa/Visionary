@@ -56,6 +56,12 @@ type MinimalRunRequestBody = {
   stepperSessionId?: string;
 };
 
+type WorkerActionLog = {
+  timestamp: string;
+  event: string;
+  detail?: unknown;
+};
+
 function log(level: "info" | "warn" | "error", message: string, extra?: Record<string, unknown>) {
   const payload = {
     level,
@@ -116,6 +122,22 @@ function writeJson(response: ServerResponse, statusCode: number, payload: unknow
   response.statusCode = statusCode;
   response.setHeader("content-type", "application/json");
   response.end(JSON.stringify(payload));
+}
+
+function now() {
+  return new Date().toISOString();
+}
+
+function buildActionLog(event: string, detail?: unknown): WorkerActionLog {
+  return {
+    timestamp: now(),
+    event,
+    detail
+  };
+}
+
+function isValidUuid(value: string) {
+  return /^[0-9a-f]{8}-[0-9a-f]{4}-[1-5][0-9a-f]{3}-[89ab][0-9a-f]{3}-[0-9a-f]{12}$/i.test(value);
 }
 
 function isAllowedArtifactPath(targetPath: string) {
@@ -463,50 +485,136 @@ async function handleNewAuditStepperAction(
   response: ServerResponse,
   action: "respond-next-question" | "continue-next-question"
 ) {
-  const body = (await readJsonBody(request)) as MinimalRunRequestBody;
+  try {
+    const body = (await readJsonBody(request)) as MinimalRunRequestBody;
+    const actionLogs: WorkerActionLog[] = [];
 
-  if (action === "continue-next-question") {
-    const stepperSessionId = body.stepperSessionId?.trim() ?? "";
-    if (!stepperSessionId) {
-      writeJson(response, 400, { ok: false, error: "missing_stepper_session_id" });
+    if (action === "continue-next-question") {
+      const stepperSessionId = body.stepperSessionId?.trim() ?? "";
+      if (!stepperSessionId) {
+        writeJson(response, 400, { ok: false, error: "missing_stepper_session_id" });
+        return;
+      }
+
+      writeJson(response, 501, {
+        ok: false,
+        error: "STEPPER_CONTINUE_NOT_IMPLEMENTED",
+        detail: "La ruta existe, pero la continuacion del stepper no esta conectada en este worker."
+      });
+      return;
+    }
+
+    const runId = body.runId?.trim() ?? "";
+    actionLogs.push(buildActionLog("RESPOND_NEXT_QUESTION_RUN_ID", {
+      runId: runId || null
+    }));
+
+    if (runId) {
+      const validUuid = isValidUuid(runId);
+      actionLogs.push(buildActionLog("RUN_ID_IS_VALID_UUID", {
+        runId,
+        valid: validUuid
+      }));
+
+      if (!validUuid) {
+        writeJson(response, 400, {
+          ok: false,
+          error: "INVALID_RUN_ID",
+          message: "runId debe ser un UUID valido",
+          actionLogs
+        });
+        return;
+      }
+
+      const run = await getSurveyRunDetails(runId).catch((error: unknown) => {
+        if (
+          error &&
+          typeof error === "object" &&
+          "code" in error &&
+          (error as { code?: string }).code === "PGRST116"
+        ) {
+          return null;
+        }
+        throw error;
+      });
+      actionLogs.push(buildActionLog("STEPPER_SESSION_LOOKUP_RESULT", {
+        runId,
+        found: Boolean(run)
+      }));
+      if (!run) {
+        writeJson(response, 404, {
+          ok: false,
+          error: "RUN_SESSION_NOT_FOUND",
+          actionLogs
+        });
+        return;
+      }
+    }
+
+    const surveyUrl = body.surveyUrl?.trim() ?? "";
+    const storeCode = body.storeCode?.trim() ?? "";
+    const validatorCode = body.validatorCode?.trim() ?? "";
+    const questionResults = Array.isArray(body.questionResults) ? body.questionResults : [];
+
+    if (!runId && (!surveyUrl || !storeCode || !validatorCode || questionResults.length === 0)) {
+      writeJson(response, 400, { ok: false, error: "missing_required_fields" });
       return;
     }
 
     writeJson(response, 501, {
       ok: false,
-      error: "STEPPER_CONTINUE_NOT_IMPLEMENTED",
-      detail: "La ruta existe, pero la continuacion del stepper no esta conectada en este worker."
+      error: "STEPPER_NOT_IMPLEMENTED",
+      detail: "La ruta existe, pero la ejecucion del stepper no esta conectada en este worker.",
+      actionLogs
     });
-    return;
+  } catch (error) {
+    const message = error instanceof Error ? error.message : "Error interno del stepper.";
+    const stack = error instanceof Error ? error.stack ?? null : null;
+    const cause =
+      error instanceof Error && "cause" in error
+        ? (() => {
+            const errorCause = (error as Error & { cause?: unknown }).cause;
+            if (errorCause instanceof Error) {
+              return {
+                message: errorCause.message,
+                stack: errorCause.stack ?? null
+              };
+            }
+            return errorCause ?? null;
+          })()
+        : null;
+    const rawError =
+      error instanceof Error
+        ? {
+            name: error.name,
+            message: error.message,
+            stack: error.stack ?? null
+          }
+        : (() => {
+            try {
+              return JSON.parse(JSON.stringify(error));
+            } catch {
+              return String(error);
+            }
+          })();
+
+    log("error", "New audit stepper action failed.", {
+      action,
+      message,
+      stack,
+      cause,
+      rawError
+    });
+
+    writeJson(response, 500, {
+      ok: false,
+      error: "worker_service_error",
+      message,
+      stack,
+      cause,
+      rawError
+    });
   }
-
-  const runId = body.runId?.trim() ?? "";
-  if (runId) {
-    const run = await getSurveyRunDetails(runId);
-    if (!run) {
-      writeJson(response, 404, {
-        ok: false,
-        error: "RUN_SESSION_NOT_FOUND"
-      });
-      return;
-    }
-  }
-
-  const surveyUrl = body.surveyUrl?.trim() ?? "";
-  const storeCode = body.storeCode?.trim() ?? "";
-  const validatorCode = body.validatorCode?.trim() ?? "";
-  const questionResults = Array.isArray(body.questionResults) ? body.questionResults : [];
-
-  if (!runId && (!surveyUrl || !storeCode || !validatorCode || questionResults.length === 0)) {
-    writeJson(response, 400, { ok: false, error: "missing_required_fields" });
-    return;
-  }
-
-  writeJson(response, 501, {
-    ok: false,
-    error: "STEPPER_NOT_IMPLEMENTED",
-    detail: "La ruta existe, pero la ejecucion del stepper no esta conectada en este worker."
-  });
 }
 
 async function handleMinimalSurveyAction(
@@ -774,17 +882,51 @@ const server = createServer(async (request, response) => {
     });
   } catch (error) {
     const message = error instanceof Error ? error.message : "Error interno del servicio operativo.";
+    const stack = error instanceof Error ? error.stack ?? null : null;
+    const cause =
+      error instanceof Error && "cause" in error
+        ? (() => {
+            const errorCause = (error as Error & { cause?: unknown }).cause;
+            if (errorCause instanceof Error) {
+              return {
+                message: errorCause.message,
+                stack: errorCause.stack ?? null
+              };
+            }
+            return errorCause ?? null;
+          })()
+        : null;
+    const rawError =
+      error instanceof Error
+        ? {
+            name: error.name,
+            message: error.message,
+            stack: error.stack ?? null
+          }
+        : (() => {
+            try {
+              return JSON.parse(JSON.stringify(error));
+            } catch {
+              return String(error);
+            }
+          })();
     log("error", "Request failed.", {
       method,
       path: url.pathname,
       origin,
-      error: message
+      error: message,
+      stack,
+      cause,
+      rawError
     });
 
     const payload = {
       ok: false,
       error: "worker_service_error",
-      detail: message
+      message,
+      stack,
+      cause,
+      rawError
     };
     writeJson(response, 500, payload);
     log("error", "Error response returned.", {
