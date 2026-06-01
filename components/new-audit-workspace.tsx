@@ -905,19 +905,8 @@ function chooseQuestionBatchSize(input: {
   photoCount: number;
   generalInstructions: string;
 }) {
-  if (input.questionCount <= 3) {
+  if (input.questionCount <= 2) {
     return input.questionCount;
-  }
-
-  if (input.questionCount <= 4) {
-    return input.questionCount;
-  }
-
-  const lightInstructionLoad = input.generalInstructions.trim().length <= 1800;
-  const lowPhotoLoad = input.photoCount <= 2;
-
-  if (input.questionCount <= 6 && lowPhotoLoad && lightInstructionLoad) {
-    return 3;
   }
 
   return 2;
@@ -2239,6 +2228,22 @@ export function NewAuditWorkspace() {
       perPhotoAnalysis: input.initialPerPhotoAnalysis,
       generalInstructions: input.generalInstructions
     };
+    pushVisualLog("PHASE_C_INPUT_IDS", {
+      activeQuestionIds: questionIds,
+      questionUnderstandingIds: input.questionUnderstanding.map((question) => question.questionId),
+      previousResultIds: input.workingQuestions
+        .filter(
+          (question) =>
+            questionIds.includes(question.id) &&
+            (question.status === "answered" || question.status === "needs_review") &&
+            question.suggestedAnswer &&
+            question.suggestedAnswer !== "PENDIENTE_ANALISIS_VISUAL"
+        )
+        .map((question) => question.id),
+      answerPayloadQuestionIds: preparedQuestionUnderstanding.map((question) => question.questionId),
+      batchNumber: input.batchNumber,
+      totalBatches: input.totalBatches
+    });
     const payloadSizeBytes = estimateUtf8Bytes(JSON.stringify(answerPayload));
     if (payloadSizeBytes > MAX_VISUAL_PAYLOAD_BYTES) {
       throw new Error("El payload visual es demasiado grande. Reduce fotos o usa URLs en lugar de base64.");
@@ -2831,25 +2836,6 @@ export function NewAuditWorkspace() {
       });
       const phaseCStartedAt = Date.now();
       const activeQuestionIds = serializedQuestions.map((question) => question.id);
-      const questionUnderstandingIds = phaseAResult.questionUnderstanding.map((question) => question.questionId);
-      const previousResultIds = projectQuestions
-        .filter(
-          (question) =>
-            activeQuestionIds.includes(question.id) &&
-            (question.status === "answered" || question.status === "needs_review") &&
-            question.suggestedAnswer &&
-            question.suggestedAnswer !== "PENDIENTE_ANALISIS_VISUAL"
-        )
-        .map((question) => question.id);
-      const answerPayloadQuestionIds = phaseAResult.questionUnderstanding
-        .filter((question) => activeQuestionIds.includes(question.questionId))
-        .map((question) => question.questionId);
-      pushVisualLog("PHASE_C_INPUT_IDS", {
-        activeQuestionIds,
-        questionUnderstandingIds,
-        previousResultIds,
-        answerPayloadQuestionIds
-      });
       pushVisualLog("PHASE_C_ANSWERS_STARTED", {
         questionIds: activeQuestionIds,
         questionCount: serializedQuestions.length,
