@@ -49,9 +49,11 @@ type MinimalRunRequestBody = {
   surveyUrl?: string;
   storeCode?: string;
   validatorCode?: string;
+  runId?: string;
   questionResults?: MinimalQuestionResultPayload[];
   needsReviewBehavior?: "stop" | "select_no_puedo_responder";
   preparedSessionId?: string;
+  stepperSessionId?: string;
 };
 
 function log(level: "info" | "warn" | "error", message: string, extra?: Record<string, unknown>) {
@@ -456,6 +458,57 @@ function normalizeQuestionResults(questionResults: MinimalQuestionResultPayload[
   }));
 }
 
+async function handleNewAuditStepperAction(
+  request: IncomingMessage,
+  response: ServerResponse,
+  action: "respond-next-question" | "continue-next-question"
+) {
+  const body = (await readJsonBody(request)) as MinimalRunRequestBody;
+
+  if (action === "continue-next-question") {
+    const stepperSessionId = body.stepperSessionId?.trim() ?? "";
+    if (!stepperSessionId) {
+      writeJson(response, 400, { ok: false, error: "missing_stepper_session_id" });
+      return;
+    }
+
+    writeJson(response, 501, {
+      ok: false,
+      error: "STEPPER_CONTINUE_NOT_IMPLEMENTED",
+      detail: "La ruta existe, pero la continuacion del stepper no esta conectada en este worker."
+    });
+    return;
+  }
+
+  const runId = body.runId?.trim() ?? "";
+  if (runId) {
+    const run = await getSurveyRunDetails(runId);
+    if (!run) {
+      writeJson(response, 404, {
+        ok: false,
+        error: "RUN_SESSION_NOT_FOUND"
+      });
+      return;
+    }
+  }
+
+  const surveyUrl = body.surveyUrl?.trim() ?? "";
+  const storeCode = body.storeCode?.trim() ?? "";
+  const validatorCode = body.validatorCode?.trim() ?? "";
+  const questionResults = Array.isArray(body.questionResults) ? body.questionResults : [];
+
+  if (!runId && (!surveyUrl || !storeCode || !validatorCode || questionResults.length === 0)) {
+    writeJson(response, 400, { ok: false, error: "missing_required_fields" });
+    return;
+  }
+
+  writeJson(response, 501, {
+    ok: false,
+    error: "STEPPER_NOT_IMPLEMENTED",
+    detail: "La ruta existe, pero la ejecucion del stepper no esta conectada en este worker."
+  });
+}
+
 async function handleMinimalSurveyAction(
   request: IncomingMessage,
   response: ServerResponse,
@@ -669,6 +722,16 @@ const server = createServer(async (request, response) => {
 
     if (method === "POST" && url.pathname === "/minimal-runs/submit-confirmed-survey") {
       await handleMinimalSurveyAction(request, response, "submit-confirmed-survey");
+      return;
+    }
+
+    if (method === "POST" && url.pathname === "/new-audit/respond-next-question") {
+      await handleNewAuditStepperAction(request, response, "respond-next-question");
+      return;
+    }
+
+    if (method === "POST" && url.pathname === "/new-audit/continue-next-question") {
+      await handleNewAuditStepperAction(request, response, "continue-next-question");
       return;
     }
 
