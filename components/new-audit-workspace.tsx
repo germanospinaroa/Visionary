@@ -872,6 +872,10 @@ function chooseQuestionBatchSize(input: {
     return input.questionCount;
   }
 
+  if (input.questionCount <= 4) {
+    return input.questionCount;
+  }
+
   const lightInstructionLoad = input.generalInstructions.trim().length <= 1800;
   const lowPhotoLoad = input.photoCount <= 2;
 
@@ -2654,6 +2658,15 @@ export function NewAuditWorkspace() {
     try {
       const serializedQuestions = await serializeVisualQuestions(activeProjectQuestions);
       serializedQuestionsRef.current = serializedQuestions;
+      const questionBankHash = buildQuestionBankHash(activeProjectQuestions);
+      const cachedUnderstanding =
+        questionUnderstandingFingerprint === questionBankHash.fingerprint && questionUnderstanding.length === activeProjectQuestions.length
+          ? questionUnderstanding
+          : getCachedQuestionUnderstanding(questionBankHash.hash);
+      const hasCompleteCachedUnderstanding =
+        Array.isArray(cachedUnderstanding) &&
+        cachedUnderstanding.length === activeProjectQuestions.length &&
+        activeProjectQuestions.every((question) => cachedUnderstanding.some((item) => item.questionId === question.id));
       const batchSize = chooseQuestionBatchSize({
         questionCount: serializedQuestions.length,
         photoCount: imageLinks.length,
@@ -2683,18 +2696,30 @@ export function NewAuditWorkspace() {
       pushVisualLog("PHASE_A_QUESTION_BANK_STARTED", {
         questionIds: serializedQuestions.map((question) => question.id),
         questionCount: serializedQuestions.length,
+        cacheHit: hasCompleteCachedUnderstanding,
         timestamp: new Date().toISOString()
       });
-      const phaseAResult = await analyzeQuestionBankInBatches({
-        serializedQuestions,
-        generalInstructions
-      });
+      const phaseAResult = hasCompleteCachedUnderstanding && cachedUnderstanding
+        ? {
+            questionUnderstanding: cachedUnderstanding,
+            receivedQuestionIds: cachedUnderstanding.map((item) => item.questionId),
+            missingQuestionIds: [] as number[],
+            status: "completed" as const
+          }
+        : await analyzeQuestionBankInBatches({
+            serializedQuestions,
+            generalInstructions
+          });
       setQuestionUnderstanding(phaseAResult.questionUnderstanding);
-      setQuestionUnderstandingFingerprint(buildQuestionBankHash(activeProjectQuestions).fingerprint);
+      setQuestionUnderstandingFingerprint(questionBankHash.fingerprint);
+      if (!hasCompleteCachedUnderstanding) {
+        saveCachedQuestionUnderstanding(questionBankHash.hash, phaseAResult.questionUnderstanding);
+      }
       pushVisualLog("PHASE_A_QUESTION_BANK_COMPLETED", {
         questionIds: serializedQuestions.map((question) => question.id),
         receivedQuestionIds: phaseAResult.receivedQuestionIds,
         missingQuestionIds: phaseAResult.missingQuestionIds,
+        cacheHit: hasCompleteCachedUnderstanding,
         durationMs: Date.now() - phaseAStartedAt,
         timestamp: new Date().toISOString()
       });
