@@ -744,35 +744,6 @@ export function validateVisualAnalysisInput(input: {
   };
 }
 
-function buildFallbackQuestionResult(question: VisualQuestionInput, reason: string): VisualQuestionResult {
-  return {
-    questionId: question.id,
-    questionText: question.text ?? "",
-    targetVisible: false,
-    targetMatchConfidence: 0.35,
-    targetEvidence: [],
-    answer: chooseExpectedOption(
-      question.expectedOptions,
-      "No puedo responder",
-      reason,
-      ["No hay evidencia visual suficiente para responder con certeza."]
-    ),
-    confidence: 0.35,
-    reasoning: reason,
-    storePhotosUsed: [],
-    evidence: ["No hay evidencia visual suficiente en las fotos reales para una respuesta concluyente."],
-    visualDiagnostic: {
-      whatTheQuestionAsks: question.text ?? "",
-      requiredEvidence: [],
-      evidenceFound: [],
-      evidenceMissing: ["No hay evidencia visual suficiente en las fotos reales de tienda."],
-      visualComparisonWithReference: "No fue posible completar la comparacion visual con la referencia.",
-      decisionRuleApplied: "Se aplico 'No puedo responder' por falta de evidencia suficiente."
-    },
-    status: "needs_review"
-  };
-}
-
 export async function runNewAuditVisualAnalysis(input: {
   storePhotos: VisualStorePhotoInput[];
   projectQuestions: VisualQuestionInput[];
@@ -945,21 +916,9 @@ export async function runNewAuditVisualAnalysis(input: {
     parsed,
     new Map(activeQuestions.map((question) => [question.id, question.expectedOptions]))
   );
-  const normalizedQuestionIds = new Set(normalized.questionResults.map((question) => question.questionId));
-  const missingResults = activeQuestions
-    .filter((question) => !normalizedQuestionIds.has(question.id))
-    .map((question) =>
-      buildFallbackQuestionResult(
-        question,
-        "No se recibio resultado del modelo para esta pregunta. Se requiere revision manual."
-      )
-    );
   console.log("MAPPING_COMPLETE", normalized.questionResults.map((question) => question.questionId));
 
-  return {
-    ...normalized,
-    questionResults: [...normalized.questionResults, ...missingResults]
-  };
+  return normalized;
 }
 
 function getActiveQuestions(projectQuestions: VisualQuestionInput[]) {

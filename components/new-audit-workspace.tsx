@@ -260,6 +260,9 @@ type ErrorDetails = {
   stack?: string | null;
   batch?: number | null;
   questionIds?: number[];
+  expectedQuestionIds?: number[];
+  receivedQuestionIds?: number[];
+  missingQuestionIds?: number[];
   openAiApiKeyConfigured?: boolean | null;
   storePhotosReceived?: number | null;
   projectQuestionsReceived?: number | null;
@@ -295,7 +298,7 @@ type SerializedVisualQuestion = {
   expectedOptions: string[];
 };
 
-type VisualBatchStatus = "pending" | "running" | "completed" | "failed";
+type VisualBatchStatus = "pending" | "running" | "completed" | "failed" | "partial_failed";
 
 type VisualBatchState = {
   batchNumber: number;
@@ -930,7 +933,7 @@ function buildFinalReviewState(questions: ProjectQuestion[], batchStates: Visual
   const pendingCount = activeQuestions.filter((question) => question.status === "pending" || question.status === "analyzing").length;
   const photosUsedCount = new Set(activeQuestions.flatMap((question) => question.storePhotosUsed ?? [])).size;
   const batchFailures = batchStates
-    .filter((batch) => batch.status === "failed")
+    .filter((batch) => batch.status === "failed" || batch.status === "partial_failed")
     .map((batch) => ({
       batch: batch.batchNumber,
       questionIds: batch.questionIds,
@@ -947,6 +950,33 @@ function buildFinalReviewState(questions: ProjectQuestion[], batchStates: Visual
     pendingCount,
     photosUsedCount,
     batchFailures
+  };
+}
+
+function buildBatchIncompleteErrorDetails(input: {
+  batch: number;
+  expectedQuestionIds: number[];
+  receivedQuestionIds: number[];
+  missingQuestionIds: number[];
+  endpoint: string;
+}): ErrorDetails {
+  return {
+    message: `Batch incompleto: faltan preguntas ${input.missingQuestionIds.join(", ")}.`,
+    endpoint: input.endpoint,
+    status: 200,
+    body: {
+      ok: true,
+      error: "PARTIAL_BATCH_RESULT",
+      expectedQuestionIds: input.expectedQuestionIds,
+      receivedQuestionIds: input.receivedQuestionIds,
+      missingQuestionIds: input.missingQuestionIds
+    },
+    stack: null,
+    batch: input.batch,
+    questionIds: input.expectedQuestionIds,
+    expectedQuestionIds: input.expectedQuestionIds,
+    receivedQuestionIds: input.receivedQuestionIds,
+    missingQuestionIds: input.missingQuestionIds
   };
 }
 
@@ -2098,6 +2128,131 @@ export function NewAuditWorkspace() {
     return resolvedUnderstanding;
   }
 
+  async function executeVisualAnswerBatch(input: {
+    batchQuestions: SerializedVisualQuestion[];
+    batchNumber: number;
+    totalBatches: number;
+    workingQuestions: ProjectQuestion[];
+    workingKnowledgeBase: KnowledgeBase;
+    storePhotos: ReturnType<typeof buildStorePhotosForVisualAnalysis>;
+    initialPerPhotoAnalysis: PerPhotoAnalysis[];
+    generalInstructions: string;
+    previousQuestionStateById: Map<number, ProjectQuestion>;
+  }): Promise<{
+    workingQuestions: ProjectQuestion[];
+    workingKnowledgeBase: KnowledgeBase;
+    status: VisualBatchStatus;
+    error: ErrorDetails | null;
+    receivedQuestionIds: number[];
+    missingQuestionIds: number[];
+    questionIds: number[];
+  }> {
+    const questionIds = input.batchQuestions.map((question) => question.id);
+    const preparedQuestionUnderstanding = await resolveQuestionUnderstandingForBatch({
+      batchQuestions: input.batchQuestions,
+      generalInstructions: input.generalInstructions,
+      batchNumber: input.batchNumber,
+      totalBatches: input.totalBatches
+    });
+
+    const answerPayload = {
+      questionUnderstanding: preparedQuestionUnderstanding,
+      storePhotos: input.storePhotos,
+      knowledgeBase: input.workingKnowledgeBase,
+      perPhotoAnalysis: input.initialPerPhotoAnalysis,
+      generalInstructions: input.generalInstructions
+    };
+    const payloadSizeBytes = estimateUtf8Bytes(JSON.stringify(answerPayload));
+    if (payloadSizeBytes > MAX_VISUAL_PAYLOAD_BYTES) {
+      throw new Error("El payload visual es demasiado grande. Reduce fotos o usa URLs en lugar de base64.");
+    }
+
+    const answerResult = await fetchVisualStage<{
+      questionResults: Array<{
+        questionId: number;
+        questionText?: string;
+        answer: string;
+        confidence: number;
+        reasoning: string;
+        storePhotosUsed: number[];
+        evidence: string[];
+        visualDiagnostic: {
+          whatTheQuestionAsks: string;
+          requiredEvidence: string[];
+          evidenceFound: string[];
+          evidenceMissing: string[];
+          visualComparisonWithReference: string;
+          decisionRuleApplied: string;
+        };
+        status: "answered" | "needs_review";
+      }>;
+    }>({
+      endpoint: "/api/new-audit/answer-questions",
+      payload: answerPayload,
+      payloadSizeBytes,
+      photoCount: input.storePhotos.length,
+      questionCount: preparedQuestionUnderstanding.length,
+      timeoutMessage: `El batch ${input.batchNumber}/${input.totalBatches} excedio el timeout del servidor.`
+    });
+
+    const receivedQuestionIds = answerResult.parsed.questionResults.map((item) => item.questionId);
+    const receivedQuestionIdSet = new Set(receivedQuestionIds);
+    const missingQuestionIds = questionIds.filter((id) => !receivedQuestionIdSet.has(id));
+    const resultsByQuestionId = new Map(answerResult.parsed.questionResults.map((item) => [item.questionId, item]));
+
+    const updatedQuestions = input.workingQuestions.map((question) => {
+      if (!questionIds.includes(question.id)) {
+        return question;
+      }
+
+      const result = resultsByQuestionId.get(question.id);
+      if (!result) {
+        return input.previousQuestionStateById.get(question.id) ?? question;
+      }
+
+      return {
+        ...question,
+        status: result.status,
+        suggestedAnswer: result.answer,
+        confidence: result.confidence,
+        reasoning: result.reasoning,
+        storePhotosUsed: result.storePhotosUsed,
+        evidence: result.evidence,
+        visualDiagnostic: result.visualDiagnostic
+      };
+    });
+
+    if (missingQuestionIds.length > 0) {
+      const errorDetails = buildBatchIncompleteErrorDetails({
+        batch: input.batchNumber,
+        expectedQuestionIds: questionIds,
+        receivedQuestionIds,
+        missingQuestionIds,
+        endpoint: "/api/new-audit/answer-questions"
+      });
+
+      return {
+        workingQuestions: updatedQuestions,
+        workingKnowledgeBase: buildMergedKnowledgeBase(input.workingKnowledgeBase, updatedQuestions),
+        status: "partial_failed",
+        error: errorDetails,
+        receivedQuestionIds,
+        missingQuestionIds,
+        questionIds
+      };
+    }
+
+    return {
+      workingQuestions: updatedQuestions,
+      workingKnowledgeBase: buildMergedKnowledgeBase(input.workingKnowledgeBase, updatedQuestions),
+      status: "completed",
+      error: null,
+      receivedQuestionIds,
+      missingQuestionIds,
+      questionIds
+    };
+  }
+
   async function runQuestionBatchPipeline(input: {
     serializedQuestions: SerializedVisualQuestion[];
     storePhotos: ReturnType<typeof buildStorePhotosForVisualAnalysis>;
@@ -2159,110 +2314,64 @@ export function NewAuditWorkspace() {
       });
 
       try {
-        const preparedQuestionUnderstanding = await resolveQuestionUnderstandingForBatch({
+        const previousQuestionStateById = new Map(
+          workingQuestions
+            .filter((question) => questionIds.includes(question.id))
+            .map((question) => [question.id, { ...question }])
+        );
+        const batchOutcome = await executeVisualAnswerBatch({
           batchQuestions,
-          generalInstructions,
           batchNumber: batchIndex + 1,
-          totalBatches: chunks.length
-        });
-
-        const answerPayload = {
-          questionUnderstanding: preparedQuestionUnderstanding,
+          totalBatches: chunks.length,
+          workingQuestions,
+          workingKnowledgeBase,
           storePhotos: input.storePhotos,
-          knowledgeBase: workingKnowledgeBase,
-          perPhotoAnalysis: input.initialPerPhotoAnalysis,
-          generalInstructions
-        };
-        const payloadSizeBytes = estimateUtf8Bytes(JSON.stringify(answerPayload));
-        if (payloadSizeBytes > MAX_VISUAL_PAYLOAD_BYTES) {
-          throw new Error("El payload visual es demasiado grande. Reduce fotos o usa URLs en lugar de base64.");
-        }
-
-        const answerResult = await fetchVisualStage<{
-          questionResults: Array<{
-            questionId: number;
-            questionText?: string;
-            answer: string;
-            confidence: number;
-            reasoning: string;
-            storePhotosUsed: number[];
-            evidence: string[];
-            visualDiagnostic: {
-              whatTheQuestionAsks: string;
-              requiredEvidence: string[];
-              evidenceFound: string[];
-              evidenceMissing: string[];
-              visualComparisonWithReference: string;
-              decisionRuleApplied: string;
-            };
-            status: "answered" | "needs_review";
-          }>;
-        }>({
-          endpoint: "/api/new-audit/answer-questions",
-          payload: answerPayload,
-          payloadSizeBytes,
-          photoCount: input.storePhotos.length,
-          questionCount: preparedQuestionUnderstanding.length,
-          timeoutMessage: `El batch ${batchIndex + 1}/${chunks.length} excedio el timeout del servidor.`
+          initialPerPhotoAnalysis: input.initialPerPhotoAnalysis,
+          generalInstructions,
+          previousQuestionStateById
         });
 
-        const resultsByQuestionId = new Map(answerResult.parsed.questionResults.map((item) => [item.questionId, item]));
-        for (let index = 0; index < workingQuestions.length; index += 1) {
-          const question = workingQuestions[index];
-          if (!question || !questionIds.includes(question.id)) {
-            continue;
-          }
-
-          const result = resultsByQuestionId.get(question.id);
-          if (!result) {
-            workingQuestions[index] = {
-              ...question,
-              status: "needs_review",
-              suggestedAnswer: "No puedo responder",
-              confidence: 0.35,
-              reasoning: "No se recibio resultado para esta pregunta. Se requiere revision manual.",
-              storePhotosUsed: [],
-              evidence: ["Sin resultado devuelto por el batch visual."],
-              visualDiagnostic: {
-                whatTheQuestionAsks: question.text ?? "",
-                requiredEvidence: [],
-                evidenceFound: [],
-                evidenceMissing: ["No se recibio resultado del modelo para esta pregunta."],
-                visualComparisonWithReference: "Sin comparacion disponible por falta de respuesta del modelo.",
-                decisionRuleApplied: "Se marco needs_review por falta de respuesta del batch."
-              }
-            };
-            continue;
-          }
-
-          workingQuestions[index] = {
-            ...question,
-            status: result.status,
-            suggestedAnswer: result.answer,
-            confidence: result.confidence,
-            reasoning: result.reasoning,
-            storePhotosUsed: result.storePhotosUsed,
-            evidence: result.evidence,
-            visualDiagnostic: result.visualDiagnostic
-          };
-        }
-
-        workingKnowledgeBase = buildMergedKnowledgeBase(workingKnowledgeBase, workingQuestions);
+        workingQuestions.splice(0, workingQuestions.length, ...batchOutcome.workingQuestions);
+        workingKnowledgeBase = batchOutcome.workingKnowledgeBase;
         setKnowledgeBase(workingKnowledgeBase);
         setProjectQuestions([...workingQuestions]);
         nextBatchStates = nextBatchStates.map((batch) =>
-          batch.batchNumber === batchIndex + 1 ? { ...batch, status: "completed", error: null } : batch
+          batch.batchNumber === batchIndex + 1
+            ? { ...batch, status: batchOutcome.status, error: batchOutcome.error }
+            : batch
         );
         setVisualPipelineState((current) => ({
           ...current,
           knowledgeBaseMerge: "running",
           batchStates: nextBatchStates
         }));
-        pushVisualLog("QUESTION_BATCH_COMPLETED", {
-          batch: batchIndex + 1,
-          totalBatches: chunks.length,
-          questionIds
-        });
+        pushVisualLog(
+          batchOutcome.status === "completed" ? "QUESTION_BATCH_COMPLETED" : "QUESTION_BATCH_FAILED",
+          {
+            batch: batchIndex + 1,
+            totalBatches: chunks.length,
+            questionIds,
+            expectedQuestionIds: questionIds,
+            receivedQuestionIds: batchOutcome.receivedQuestionIds,
+            missingQuestionIds: batchOutcome.missingQuestionIds,
+            error: batchOutcome.error?.message ?? null
+          }
+        );
+        if (batchOutcome.status !== "completed") {
+          setPreviewError(batchOutcome.error);
+          setVisualPipelineState((current) => {
+            const finalState = buildFinalReviewState(workingQuestions, nextBatchStates);
+            return {
+              ...current,
+              ...finalState,
+              knowledgeBaseMerge: "failed"
+            };
+          });
+          setVisualAnalysisMessage(
+            `Batch ${batchIndex + 1}/${chunks.length} incompleto: faltan ${batchOutcome.missingQuestionIds.join(", ")}`
+          );
+          return;
+        }
       } catch (error) {
         const errorDetails = buildBatchErrorDetails({
           error,
@@ -2344,17 +2453,70 @@ export function NewAuditWorkspace() {
       return;
     }
 
+    const missingQuestionIds =
+      batchState.error?.missingQuestionIds?.length ? batchState.error.missingQuestionIds : batchState.questionIds;
+    const retryQuestions = serializedQuestionsRef.current.filter((question) => missingQuestionIds.includes(question.id));
+
+    if (retryQuestions.length === 0) {
+      setPreviewError({
+        message: "No hay preguntas faltantes para reintentar.",
+        batch: batchNumber,
+        questionIds: missingQuestionIds
+      });
+      return;
+    }
+
     setVisualAnalyzing(true);
     setPreviewError(null);
     setVisualAnalysisMessage(`Reintentando batch ${batchNumber}/${visualPipelineState.batchStates.length}...`);
     try {
-      await runQuestionBatchPipeline({
-        serializedQuestions: serializedQuestionsRef.current,
+      const previousQuestionStateById = new Map(
+        projectQuestions
+          .filter((question) => missingQuestionIds.includes(question.id))
+          .map((question) => [question.id, { ...question }])
+      );
+      setProjectQuestions((current) =>
+        current.map((question) =>
+          missingQuestionIds.includes(question.id)
+            ? {
+                ...question,
+                status: "analyzing"
+              }
+            : question
+        )
+      );
+
+      const retryOutcome = await executeVisualAnswerBatch({
+        batchQuestions: retryQuestions,
+        batchNumber,
+        totalBatches: visualPipelineState.batchStates.length,
+        workingQuestions: [...projectQuestions],
+        workingKnowledgeBase: knowledgeBase,
         storePhotos: storePhotosRef.current,
-        initialKnowledgeBase: knowledgeBase,
         initialPerPhotoAnalysis: perPhotoAnalysis,
-        startBatchIndex: batchNumber - 1
+        generalInstructions,
+        previousQuestionStateById
       });
+
+      setProjectQuestions([...retryOutcome.workingQuestions]);
+      setKnowledgeBase(retryOutcome.workingKnowledgeBase);
+      const nextBatchStates = visualPipelineState.batchStates.map((batch) =>
+        batch.batchNumber === batchNumber ? { ...batch, status: retryOutcome.status, error: retryOutcome.error } : batch
+      );
+      setVisualPipelineState((current) => {
+        const finalState = buildFinalReviewState(retryOutcome.workingQuestions, nextBatchStates);
+        return {
+          ...current,
+          ...finalState,
+          knowledgeBaseMerge: retryOutcome.status === "completed" ? "running" : "failed"
+        };
+      });
+      setPreviewError(retryOutcome.error);
+      setVisualAnalysisMessage(
+        retryOutcome.status === "completed"
+          ? `Batch ${batchNumber}/${visualPipelineState.batchStates.length} completado`
+          : `Batch ${batchNumber}/${visualPipelineState.batchStates.length} incompleto: faltan ${retryOutcome.missingQuestionIds.join(", ")}`
+      );
     } finally {
       setVisualAnalyzing(false);
     }
@@ -3836,7 +3998,7 @@ export function NewAuditWorkspace() {
               {visualAnalyzing ? "Analizando..." : "Analizar visualmente"}
             </button>
             {visualPipelineState.batchStates
-              .filter((batch) => batch.status === "failed")
+              .filter((batch) => batch.status === "failed" || batch.status === "partial_failed")
               .map((batch) => (
                 <button
                   key={`retry-batch-${batch.batchNumber}`}
