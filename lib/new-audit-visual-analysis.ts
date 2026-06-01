@@ -1000,7 +1000,12 @@ export async function runAnalyzeQuestionBank(input: {
 
   const activeQuestions = getActiveQuestions(input.projectQuestions);
   console.log("QUESTION_UNDERSTANDING_STARTED");
-  console.log("QUESTION_COUNT", activeQuestions.length);
+  console.log("QUESTION_UNDERSTANDING_INPUT", {
+    projectQuestionCount: input.projectQuestions.length,
+    activeQuestionCount: activeQuestions.length,
+    activeQuestionIds: activeQuestions.map((question) => question.id)
+  });
+  console.log("QUESTION_UNDERSTANDING_COUNT", activeQuestions.length);
 
   const content: ImageInput[] = [
     {
@@ -1011,7 +1016,9 @@ export async function runAnalyzeQuestionBank(input: {
       type: "text",
       text:
         `ETAPA 1 solamente. Construye questionUnderstanding usando las preguntas activas y sus referenceImages. ` +
-        `La referenceImage sirve solo para entender qué buscar, criterios y optionMapping. No evalúes tienda ni presencia real.`
+        `Devuelve exactamente estos campos por pregunta: questionId, questionText, expectedOptions, targetBrand, targetProduct, targetVariants, targetCategory, visualCuesFromReference, successCriteria, failureCriteria, noAnswerCriteria, optionMapping. ` +
+        `La referenceImage sirve solo para entender qué buscar, criterios y optionMapping. No evalúes tienda ni presencia real. ` +
+        `No uses numero_fisico ni texto como nombres de campo de salida; solo usa questionId y questionText.`
     }
   ];
 
@@ -1037,34 +1044,123 @@ export async function runAnalyzeQuestionBank(input: {
     }
   }
 
-  const parsed = await parseOpenAIJson<{ questionUnderstanding: VisualQuestionUnderstanding[] }>({
-    model: "gpt-4.1-mini",
-    schema: QUESTION_UNDERSTANDING_SCHEMA,
+  const prompt = {
     systemPrompt: SYSTEM_PROMPT,
     userContent: content
+  };
+  console.log("QUESTION_UNDERSTANDING_PROMPT", JSON.stringify(prompt, null, 2));
+
+  const client = getOpenAIClient();
+  console.log("OPENAI_REQUEST_START");
+  const response = await client.chat.completions.create({
+    model: "gpt-4.1-mini",
+    temperature: 0,
+    response_format: {
+      type: "json_schema",
+      json_schema: QUESTION_UNDERSTANDING_SCHEMA
+    },
+    messages: [
+      {
+        role: "system",
+        content: SYSTEM_PROMPT
+      },
+      {
+        role: "user",
+        content
+      }
+    ]
   });
+  console.log("OPENAI_RESPONSE_RECEIVED");
+
+  const rawContent = response.choices[0]?.message?.content;
+  console.log("QUESTION_UNDERSTANDING_RAW_RESPONSE", rawContent ?? null);
+  if (!rawContent) {
+    throw new Error("INVALID_VISUAL_ANALYSIS_RESPONSE");
+  }
+
+  let parsed: { questionUnderstanding: VisualQuestionUnderstanding[] };
+  try {
+    parsed = JSON.parse(rawContent) as { questionUnderstanding: VisualQuestionUnderstanding[] };
+  } catch {
+    throw new Error("INVALID_VISUAL_ANALYSIS_RESPONSE");
+  }
 
   const questionMap = new Map(activeQuestions.map((question) => [question.id, question]));
-  const questionUnderstanding = (parsed.questionUnderstanding ?? []).map((item) => ({
-    questionId: item.questionId,
-    physicalNumber: item.physicalNumber ?? questionMap.get(item.questionId)?.physicalNumber ?? "",
-    questionText: item.questionText ?? questionMap.get(item.questionId)?.text ?? "",
-    expectedOptions: item.expectedOptions ?? questionMap.get(item.questionId)?.expectedOptions ?? [],
-    targetBrand: item.targetBrand ?? [],
-    targetProduct: item.targetProduct ?? [],
-    targetVariants: item.targetVariants ?? [],
-    targetCategory: item.targetCategory ?? [],
-    visualCuesFromReference: item.visualCuesFromReference ?? [],
-    successCriteria: item.successCriteria ?? [],
-    failureCriteria: item.failureCriteria ?? [],
-    noAnswerCriteria: item.noAnswerCriteria ?? [],
-    optionMapping: (item.optionMapping ?? []).map((mapping) => ({
-      option: mapping.option ?? "",
-      meaning: mapping.meaning ?? ""
-    }))
-  }));
+  const questionUnderstanding = (parsed.questionUnderstanding ?? []).map((item) => {
+    const rawItem = item as Record<string, unknown>;
+    const rawQuestionId =
+      typeof rawItem.questionId === "number"
+        ? rawItem.questionId
+        : typeof rawItem.numero_fisico === "number"
+          ? rawItem.numero_fisico
+          : typeof rawItem.numero_fisico === "string"
+            ? Number.parseInt(rawItem.numero_fisico, 10)
+            : Number.NaN;
+    const normalizedQuestionId = Number.isFinite(rawQuestionId) ? rawQuestionId : -1;
+    const rawQuestionText =
+      typeof rawItem.questionText === "string" && rawItem.questionText.trim()
+        ? rawItem.questionText
+        : typeof rawItem.texto === "string"
+          ? rawItem.texto
+          : "";
+    const normalizedOptionMapping = Array.isArray(rawItem.optionMapping)
+      ? rawItem.optionMapping
+          .map((mapping) => {
+            if (typeof mapping === "string") {
+              return { option: mapping, meaning: mapping };
+            }
+            if (mapping && typeof mapping === "object") {
+              const candidate = mapping as { option?: unknown; meaning?: unknown };
+              return {
+                option: typeof candidate.option === "string" ? candidate.option : "",
+                meaning: typeof candidate.meaning === "string" ? candidate.meaning : ""
+              };
+            }
+            return { option: "", meaning: "" };
+          })
+          .filter((mapping) => mapping.option || mapping.meaning)
+      : [];
 
-  console.log("QUESTION_UNDERSTANDING_COMPLETE", questionUnderstanding.length);
+    return {
+      questionId: normalizedQuestionId,
+      physicalNumber:
+        (typeof rawItem.physicalNumber === "string" ? rawItem.physicalNumber : undefined) ??
+        questionMap.get(normalizedQuestionId)?.physicalNumber ??
+        "",
+      questionText: rawQuestionText || (questionMap.get(normalizedQuestionId)?.text ?? ""),
+      expectedOptions: Array.isArray(rawItem.expectedOptions)
+        ? rawItem.expectedOptions.filter((option): option is string => typeof option === "string")
+        : questionMap.get(normalizedQuestionId)?.expectedOptions ?? [],
+      targetBrand: Array.isArray(rawItem.targetBrand)
+        ? rawItem.targetBrand.filter((item): item is string => typeof item === "string")
+        : [],
+      targetProduct: Array.isArray(rawItem.targetProduct)
+        ? rawItem.targetProduct.filter((item): item is string => typeof item === "string")
+        : [],
+      targetVariants: Array.isArray(rawItem.targetVariants)
+        ? rawItem.targetVariants.filter((item): item is string => typeof item === "string")
+        : [],
+      targetCategory: Array.isArray(rawItem.targetCategory)
+        ? rawItem.targetCategory.filter((item): item is string => typeof item === "string")
+        : [],
+      visualCuesFromReference: Array.isArray(rawItem.visualCuesFromReference)
+        ? rawItem.visualCuesFromReference.filter((item): item is string => typeof item === "string")
+        : [],
+      successCriteria: Array.isArray(rawItem.successCriteria)
+        ? rawItem.successCriteria.filter((item): item is string => typeof item === "string")
+        : [],
+      failureCriteria: Array.isArray(rawItem.failureCriteria)
+        ? rawItem.failureCriteria.filter((item): item is string => typeof item === "string")
+        : [],
+      noAnswerCriteria: Array.isArray(rawItem.noAnswerCriteria)
+        ? rawItem.noAnswerCriteria.filter((item): item is string => typeof item === "string")
+        : [],
+      optionMapping: normalizedOptionMapping
+    };
+  });
+
+  console.log("QUESTION_UNDERSTANDING_NORMALIZED_RESPONSE", JSON.stringify(questionUnderstanding, null, 2));
+  console.log("QUESTION_UNDERSTANDING_OUTPUT_IDS", questionUnderstanding.map((item) => item.questionId));
   console.log(
     "REFERENCE_TARGETS_EXTRACTED",
     questionUnderstanding.map((item) => ({
@@ -1169,7 +1265,12 @@ export async function runAnswerQuestions(input: {
     throw new Error("OPENAI_API_KEY_NOT_CONFIGURED");
   }
 
-  console.log("QUESTION_COUNT", input.questionUnderstanding.length);
+  const startedAt = Date.now();
+  const questionIds = input.questionUnderstanding.map((question) => question.questionId);
+  console.log("ANSWER_QUESTIONS_INPUT", {
+    questionIds,
+    questionCount: input.questionUnderstanding.length
+  });
   const content: ImageInput[] = [
     {
       type: "text",
@@ -1221,13 +1322,57 @@ export async function runAnswerQuestions(input: {
     });
   }
 
-  const parsed = await parseOpenAIJson<VisualAnswerQuestionsResponse>({
-    model: "gpt-4.1-mini",
-    schema: ANSWER_QUESTIONS_SCHEMA,
+  const prompt = {
     systemPrompt: SYSTEM_PROMPT,
     userContent: content
+  };
+  console.log("ANSWER_QUESTIONS_PROMPT", JSON.stringify(prompt, null, 2));
+
+  const client = getOpenAIClient();
+  console.log("OPENAI_REQUEST_START");
+  const response = await client.chat.completions.create({
+    model: "gpt-4.1-mini",
+    temperature: 0,
+    response_format: {
+      type: "json_schema",
+      json_schema: ANSWER_QUESTIONS_SCHEMA
+    },
+    messages: [
+      {
+        role: "system",
+        content: SYSTEM_PROMPT
+      },
+      {
+        role: "user",
+        content
+      }
+    ]
+  });
+  console.log("OPENAI_RESPONSE_RECEIVED");
+  console.log("ANSWER_QUESTIONS_RESPONSE_USAGE", {
+    prompt_tokens: response.usage?.prompt_tokens ?? null,
+    completion_tokens: response.usage?.completion_tokens ?? null,
+    total_tokens: response.usage?.total_tokens ?? null,
+    costEstimateUsd:
+      response.usage?.prompt_tokens != null && response.usage?.completion_tokens != null
+        ? ((response.usage.prompt_tokens * 0.4) + (response.usage.completion_tokens * 1.6)) / 1_000_000
+        : null
   });
 
+  const rawContent = response.choices[0]?.message?.content;
+  console.log("ANSWER_QUESTIONS_RAW_RESPONSE", rawContent ?? null);
+  if (!rawContent) {
+    throw new Error("INVALID_VISUAL_ANALYSIS_RESPONSE");
+  }
+
+  let parsed: VisualAnswerQuestionsResponse;
+  try {
+    parsed = JSON.parse(rawContent) as VisualAnswerQuestionsResponse;
+  } catch {
+    throw new Error("INVALID_VISUAL_ANALYSIS_RESPONSE");
+  }
+
+  console.log("ANSWER_QUESTIONS_OUTPUT_IDS", (parsed.questionResults ?? []).map((question) => question.questionId));
   console.log("QUESTION_RESULTS_RETURNED", parsed.questionResults?.length ?? 0);
   console.log(
     "TARGET_EVIDENCE_SOURCE_BY_QUESTION",
@@ -1240,6 +1385,7 @@ export async function runAnswerQuestions(input: {
   const expectedOptionsByQuestionId = new Map(
     input.questionUnderstanding.map((question) => [question.questionId, question.expectedOptions])
   );
+  console.log("ANSWER_QUESTIONS_DURATION_MS", Date.now() - startedAt);
 
   return {
     questionResults: normalizeQuestionResults(parsed.questionResults ?? [], expectedOptionsByQuestionId)

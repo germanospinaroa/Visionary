@@ -1928,9 +1928,16 @@ export function NewAuditWorkspace() {
       expectedOptions: string[];
     }>;
     generalInstructions: string;
-  }) {
+  }): Promise<{
+    questionUnderstanding: VisualQuestionUnderstanding[];
+    receivedQuestionIds: number[];
+    missingQuestionIds: number[];
+    status: "completed" | "partial_failed";
+  }> {
     const chunks = splitIntoChunks(input.serializedQuestions, QUESTION_BANK_BATCH_SIZE);
     const mergedUnderstanding: VisualQuestionUnderstanding[] = [];
+    const receivedQuestionIds: number[] = [];
+    const failedQuestionIds = new Set<number>();
     let lastStatus: number | null = null;
     let lastRawText: string | null = null;
     let lastBody: unknown = null;
@@ -1969,12 +1976,14 @@ export function NewAuditWorkspace() {
           lastStatus = questionBankResult.response.status;
           lastRawText = questionBankResult.rawText;
           lastBody = questionBankResult.parsed;
-          mergedUnderstanding.push(...(questionBankResult.parsed.questionUnderstanding ?? []));
+          const resolved = questionBankResult.parsed.questionUnderstanding ?? [];
+          mergedUnderstanding.push(...resolved);
+          receivedQuestionIds.push(...resolved.map((item) => item.questionId));
 
           pushVisualLog("QUESTION_BANK_BATCH_COMPLETED", {
             batch: index + 1,
             totalBatches: chunks.length,
-            resolvedQuestions: questionBankResult.parsed.questionUnderstanding?.length ?? 0
+            resolvedQuestions: resolved.length
           });
           break;
         } catch (error) {
@@ -1987,7 +1996,15 @@ export function NewAuditWorkspace() {
           });
 
           if (attempt >= QUESTION_BANK_BATCH_RETRIES) {
-            throw new Error(`Fallo el analisis del banco en el lote ${index + 1}/${chunks.length}: ${message}`);
+            pushVisualLog("QUESTION_BANK_BATCH_FAILED", {
+              batch: index + 1,
+              totalBatches: chunks.length,
+              attempt: attempt + 1,
+              error: message,
+              questionIds: chunk.map((question) => question.id)
+            });
+            chunk.forEach((question) => failedQuestionIds.add(question.id));
+            break;
           }
 
           setVisualAnalysisMessage(`Reintentando banco ${index + 1}/${chunks.length}...`);
@@ -1998,9 +2015,11 @@ export function NewAuditWorkspace() {
 
     return {
       questionUnderstanding: mergedUnderstanding,
-      status: lastStatus,
-      rawText: lastRawText ?? "",
-      body: lastBody
+      receivedQuestionIds,
+      missingQuestionIds: input.serializedQuestions
+        .map((question) => question.id)
+        .filter((questionId) => !receivedQuestionIds.includes(questionId) || failedQuestionIds.has(questionId)),
+      status: failedQuestionIds.size > 0 ? "partial_failed" : "completed"
     };
   }
 
@@ -2108,6 +2127,15 @@ export function NewAuditWorkspace() {
       generalInstructions: input.generalInstructions
     };
     const payloadSizeBytes = estimateUtf8Bytes(JSON.stringify(questionBankPayload));
+    const questionBankStageStartedAt = Date.now();
+    pushVisualLog("VISUAL_PIPELINE_STAGE_START", {
+      stage: `analyze-question-bank batch ${input.batchNumber}`,
+      batchNumber: input.batchNumber,
+      totalBatches: input.totalBatches,
+      questionIds: input.batchQuestions.map((question) => question.id),
+      questionCount: input.batchQuestions.length,
+      timestamp: new Date().toISOString()
+    });
 
     const questionBankResult = await fetchVisualStage<{ questionUnderstanding: VisualQuestionUnderstanding[] }>({
       endpoint: "/api/new-audit/analyze-question-bank",
@@ -2116,6 +2144,16 @@ export function NewAuditWorkspace() {
       photoCount: 0,
       questionCount: input.batchQuestions.length,
       timeoutMessage: `El batch ${input.batchNumber}/${input.totalBatches} del banco de preguntas excedio el timeout.`
+    });
+    pushVisualLog("VISUAL_PIPELINE_STAGE_END", {
+      stage: `analyze-question-bank batch ${input.batchNumber}`,
+      batchNumber: input.batchNumber,
+      totalBatches: input.totalBatches,
+      durationMs: Date.now() - questionBankStageStartedAt,
+      status: questionBankResult.response.status,
+      questionIds: input.batchQuestions.map((question) => question.id),
+      questionCount: input.batchQuestions.length,
+      timestamp: new Date().toISOString()
     });
 
     const resolvedUnderstanding = questionBankResult.parsed.questionUnderstanding ?? [];
@@ -2132,6 +2170,7 @@ export function NewAuditWorkspace() {
     batchQuestions: SerializedVisualQuestion[];
     batchNumber: number;
     totalBatches: number;
+    questionUnderstanding: VisualQuestionUnderstanding[];
     workingQuestions: ProjectQuestion[];
     workingKnowledgeBase: KnowledgeBase;
     storePhotos: ReturnType<typeof buildStorePhotosForVisualAnalysis>;
@@ -2148,12 +2187,9 @@ export function NewAuditWorkspace() {
     questionIds: number[];
   }> {
     const questionIds = input.batchQuestions.map((question) => question.id);
-    const preparedQuestionUnderstanding = await resolveQuestionUnderstandingForBatch({
-      batchQuestions: input.batchQuestions,
-      generalInstructions: input.generalInstructions,
-      batchNumber: input.batchNumber,
-      totalBatches: input.totalBatches
-    });
+    const preparedQuestionUnderstanding = input.questionUnderstanding.filter((question) =>
+      questionIds.includes(question.questionId)
+    );
 
     const answerPayload = {
       questionUnderstanding: preparedQuestionUnderstanding,
@@ -2166,6 +2202,15 @@ export function NewAuditWorkspace() {
     if (payloadSizeBytes > MAX_VISUAL_PAYLOAD_BYTES) {
       throw new Error("El payload visual es demasiado grande. Reduce fotos o usa URLs en lugar de base64.");
     }
+    const answerStageStartedAt = Date.now();
+    pushVisualLog("VISUAL_PIPELINE_STAGE_START", {
+      stage: `answer-questions batch ${input.batchNumber}`,
+      batchNumber: input.batchNumber,
+      totalBatches: input.totalBatches,
+      questionIds,
+      questionCount: questionIds.length,
+      timestamp: new Date().toISOString()
+    });
 
     const answerResult = await fetchVisualStage<{
       questionResults: Array<{
@@ -2193,6 +2238,16 @@ export function NewAuditWorkspace() {
       photoCount: input.storePhotos.length,
       questionCount: preparedQuestionUnderstanding.length,
       timeoutMessage: `El batch ${input.batchNumber}/${input.totalBatches} excedio el timeout del servidor.`
+    });
+    pushVisualLog("VISUAL_PIPELINE_STAGE_END", {
+      stage: `answer-questions batch ${input.batchNumber}`,
+      batchNumber: input.batchNumber,
+      totalBatches: input.totalBatches,
+      durationMs: Date.now() - answerStageStartedAt,
+      status: answerResult.response.status,
+      questionIds,
+      questionCount: questionIds.length,
+      timestamp: new Date().toISOString()
     });
 
     const receivedQuestionIds = answerResult.parsed.questionResults.map((item) => item.questionId);
@@ -2259,6 +2314,7 @@ export function NewAuditWorkspace() {
     initialKnowledgeBase: KnowledgeBase;
     initialPerPhotoAnalysis: PerPhotoAnalysis[];
     startBatchIndex: number;
+    questionUnderstanding: VisualQuestionUnderstanding[];
   }) {
     const workingQuestions = [...projectQuestions];
     let workingKnowledgeBase = { ...input.initialKnowledgeBase };
@@ -2323,6 +2379,7 @@ export function NewAuditWorkspace() {
           batchQuestions,
           batchNumber: batchIndex + 1,
           totalBatches: chunks.length,
+          questionUnderstanding: input.questionUnderstanding,
           workingQuestions,
           workingKnowledgeBase,
           storePhotos: input.storePhotos,
@@ -2370,7 +2427,11 @@ export function NewAuditWorkspace() {
           setVisualAnalysisMessage(
             `Batch ${batchIndex + 1}/${chunks.length} incompleto: faltan ${batchOutcome.missingQuestionIds.join(", ")}`
           );
-          return;
+          return {
+            workingQuestions,
+            batchStates: nextBatchStates,
+            batchFailures: buildFinalReviewState(workingQuestions, nextBatchStates).batchFailures
+          };
         }
       } catch (error) {
         const errorDetails = buildBatchErrorDetails({
@@ -2423,7 +2484,11 @@ export function NewAuditWorkspace() {
           error: errorDetails.message
         });
         setVisualAnalysisMessage(`Batch ${batchIndex + 1}/${chunks.length} failed`);
-        return;
+        return {
+          workingQuestions,
+          batchStates: nextBatchStates,
+          batchFailures: buildFinalReviewState(workingQuestions, nextBatchStates).batchFailures
+        };
       }
     }
 
@@ -2435,6 +2500,11 @@ export function NewAuditWorkspace() {
     }));
     setVisualAnalysisMessage("Final Review completed");
     setProjectQuestions([...workingQuestions]);
+    return {
+      workingQuestions,
+      batchStates: nextBatchStates,
+      batchFailures: finalPipelineState.batchFailures
+    };
   }
 
   async function handleRetryBatch(batchNumber: number) {
@@ -2490,6 +2560,7 @@ export function NewAuditWorkspace() {
         batchQuestions: retryQuestions,
         batchNumber,
         totalBatches: visualPipelineState.batchStates.length,
+        questionUnderstanding,
         workingQuestions: [...projectQuestions],
         workingKnowledgeBase: knowledgeBase,
         storePhotos: storePhotosRef.current,
@@ -2529,6 +2600,7 @@ export function NewAuditWorkspace() {
   async function handleAnalyzeVisually(source = "unknown") {
     registerVisualAnalyzeInteraction("CLICK_ANALIZAR_VISUAL_RECIBIDO", source);
     setVisualAnalysisMessage("Iniciando analisis visual...");
+    const pipelineStartedAt = Date.now();
 
     if (imageLinks.length === 0) {
       setPreviewError({ message: "No hay fotos reales detectadas para analizar." });
@@ -2581,12 +2653,10 @@ export function NewAuditWorkspace() {
 
     try {
       const serializedQuestions = await serializeVisualQuestions(activeProjectQuestions);
-      const storePhotos = buildStorePhotosForVisualAnalysis();
       serializedQuestionsRef.current = serializedQuestions;
-      storePhotosRef.current = storePhotos;
       const batchSize = chooseQuestionBatchSize({
         questionCount: serializedQuestions.length,
-        photoCount: storePhotos.length,
+        photoCount: imageLinks.length,
         generalInstructions
       });
       const chunks = splitIntoChunks(serializedQuestions, batchSize);
@@ -2609,6 +2679,28 @@ export function NewAuditWorkspace() {
         batchFailures: []
       });
 
+      const phaseAStartedAt = Date.now();
+      pushVisualLog("PHASE_A_QUESTION_BANK_STARTED", {
+        questionIds: serializedQuestions.map((question) => question.id),
+        questionCount: serializedQuestions.length,
+        timestamp: new Date().toISOString()
+      });
+      const phaseAResult = await analyzeQuestionBankInBatches({
+        serializedQuestions,
+        generalInstructions
+      });
+      setQuestionUnderstanding(phaseAResult.questionUnderstanding);
+      setQuestionUnderstandingFingerprint(buildQuestionBankHash(activeProjectQuestions).fingerprint);
+      pushVisualLog("PHASE_A_QUESTION_BANK_COMPLETED", {
+        questionIds: serializedQuestions.map((question) => question.id),
+        receivedQuestionIds: phaseAResult.receivedQuestionIds,
+        missingQuestionIds: phaseAResult.missingQuestionIds,
+        durationMs: Date.now() - phaseAStartedAt,
+        timestamp: new Date().toISOString()
+      });
+
+      const storePhotos = buildStorePhotosForVisualAnalysis();
+      storePhotosRef.current = storePhotos;
       const storePayload = {
         storePhotos,
         generalInstructions
@@ -2617,6 +2709,18 @@ export function NewAuditWorkspace() {
       if (payloadSizeBytes > MAX_VISUAL_PAYLOAD_BYTES) {
         throw new Error("El payload visual es demasiado grande. Reduce fotos o usa URLs en lugar de base64.");
       }
+      const storeStageStartedAt = Date.now();
+      pushVisualLog("VISUAL_PIPELINE_STAGE_START", {
+        stage: "analyze-store-photos",
+        batchNumber: 0,
+        photoCount: storePhotos.length,
+        questionCount: 0,
+        timestamp: new Date().toISOString()
+      });
+      pushVisualLog("PHASE_B_STORE_ANALYSIS_STARTED", {
+        photoCount: storePhotos.length,
+        timestamp: new Date().toISOString()
+      });
       pushVisualLog("payload enviado", {
         stage: "store_pre_scan",
         payloadSizeBytes,
@@ -2653,13 +2757,41 @@ export function NewAuditWorkspace() {
         detectedProducts: initialKnowledgeBase.productsDetected.length,
         detectedBrands: initialKnowledgeBase.brandsDetected.length
       });
-
-      await runQuestionBatchPipeline({
+      pushVisualLog("VISUAL_PIPELINE_STAGE_END", {
+        stage: "analyze-store-photos",
+        batchNumber: 0,
+        durationMs: Date.now() - storeStageStartedAt,
+        status: storeResult.response.status,
+        photoCount: storePhotos.length,
+        questionCount: 0,
+        timestamp: new Date().toISOString()
+      });
+      pushVisualLog("PHASE_B_STORE_ANALYSIS_COMPLETED", {
+        photoCount: storePhotos.length,
+        durationMs: Date.now() - storeStageStartedAt,
+        timestamp: new Date().toISOString()
+      });
+      const phaseCStartedAt = Date.now();
+      pushVisualLog("PHASE_C_ANSWERS_STARTED", {
+        questionIds: serializedQuestions.map((question) => question.id),
+        questionCount: serializedQuestions.length,
+        timestamp: new Date().toISOString()
+      });
+      const phaseCResult = await runQuestionBatchPipeline({
         serializedQuestions,
         storePhotos,
         initialKnowledgeBase,
         initialPerPhotoAnalysis: storeResult.parsed.perPhotoAnalysis,
-        startBatchIndex: 0
+        startBatchIndex: 0,
+        questionUnderstanding: phaseAResult.questionUnderstanding
+      });
+      pushVisualLog("PHASE_C_ANSWERS_COMPLETED", {
+        answeredQuestionIds: phaseCResult.workingQuestions
+          .filter((question) => question.status === "answered")
+          .map((question) => question.id),
+        failedQuestionIds: phaseCResult.batchFailures.flatMap((batch) => batch.questionIds),
+        durationMs: Date.now() - phaseCStartedAt,
+        timestamp: new Date().toISOString()
       });
     } catch (error) {
       const rawMessage = error instanceof Error ? error.message : String(error);
@@ -2730,6 +2862,10 @@ export function NewAuditWorkspace() {
         )
       );
     } finally {
+      pushVisualLog("TOTAL_PIPELINE_DURATION_MS", {
+        durationMs: Date.now() - pipelineStartedAt,
+        timestamp: new Date().toISOString()
+      });
       setVisualAnalyzing(false);
     }
   }
