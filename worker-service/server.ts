@@ -5,6 +5,16 @@ import { URL } from "node:url";
 import { loadEnvConfig } from "@next/env";
 import { createSupabaseAdminClient } from "@/lib/supabase/admin";
 import { getOpenAIClient } from "@/lib/openai";
+import {
+  runAnalyzeQuestionBank,
+  runAnalyzeStorePhotos,
+  runAnswerQuestions,
+  type VisualKnowledgeBase,
+  type VisualQuestionInput,
+  type VisualQuestionUnderstanding,
+  type VisualStoreAnalysisResponse,
+  type VisualStorePhotoInput
+} from "@/lib/new-audit-visual-analysis";
 import { createBrowserEvent, getSurveyRunDetails, updateSurveyRun } from "@/lib/pilot/db";
 import {
   runMinimalSurveyFlow,
@@ -56,6 +66,24 @@ type MinimalRunRequestBody = {
   stepperSessionId?: string;
 };
 
+type NewAuditAnalyzeStorePhotosRequestBody = {
+  storePhotos?: VisualStorePhotoInput[];
+  generalInstructions?: string;
+};
+
+type NewAuditAnalyzeQuestionBankRequestBody = {
+  projectQuestions?: VisualQuestionInput[];
+  generalInstructions?: string;
+};
+
+type NewAuditAnswerQuestionsRequestBody = {
+  questionUnderstanding?: VisualQuestionUnderstanding[];
+  storePhotos?: VisualStorePhotoInput[];
+  knowledgeBase?: VisualKnowledgeBase;
+  perPhotoAnalysis?: VisualStoreAnalysisResponse["perPhotoAnalysis"];
+  generalInstructions?: string;
+};
+
 type WorkerActionLog = {
   timestamp: string;
   event: string;
@@ -105,17 +133,23 @@ function assertRequiredEnv() {
 }
 
 async function readJsonBody(request: IncomingMessage) {
+  const rawBody = await readRawBody(request);
+
+  if (!rawBody) {
+    return {};
+  }
+
+  return JSON.parse(rawBody) as Record<string, unknown>;
+}
+
+async function readRawBody(request: IncomingMessage) {
   const chunks: Buffer[] = [];
 
   for await (const chunk of request) {
     chunks.push(Buffer.from(chunk));
   }
 
-  if (chunks.length === 0) {
-    return {};
-  }
-
-  return JSON.parse(Buffer.concat(chunks).toString("utf8")) as Record<string, unknown>;
+  return Buffer.concat(chunks).toString("utf8");
 }
 
 function writeJson(response: ServerResponse, statusCode: number, payload: unknown) {
@@ -138,6 +172,25 @@ function buildActionLog(event: string, detail?: unknown): WorkerActionLog {
 
 function isValidUuid(value: string) {
   return /^[0-9a-f]{8}-[0-9a-f]{4}-[1-5][0-9a-f]{3}-[89ab][0-9a-f]{3}-[0-9a-f]{12}$/i.test(value);
+}
+
+function isVisualPhotoArray(value: unknown): value is VisualStorePhotoInput[] {
+  return Array.isArray(value);
+}
+
+function isVisualQuestionArray(value: unknown): value is VisualQuestionInput[] {
+  return Array.isArray(value);
+}
+
+function isVisualQuestionUnderstandingArray(value: unknown): value is VisualQuestionUnderstanding[] {
+  return Array.isArray(value);
+}
+
+function writeInvalidPayload(response: ServerResponse, error: string, status = 400) {
+  writeJson(response, status, {
+    ok: false,
+    error
+  });
 }
 
 function isAllowedArtifactPath(targetPath: string) {
@@ -486,10 +539,8 @@ async function handleNewAuditStepperAction(
   action: "respond-next-question" | "continue-next-question"
 ) {
   try {
-    const body = (await readJsonBody(request)) as MinimalRunRequestBody;
-    const actionLogs: WorkerActionLog[] = [];
-
     if (action === "continue-next-question") {
+      const body = (await readJsonBody(request)) as MinimalRunRequestBody;
       const stepperSessionId = body.stepperSessionId?.trim() ?? "";
       if (!stepperSessionId) {
         writeJson(response, 400, { ok: false, error: "missing_stepper_session_id" });
@@ -504,51 +555,87 @@ async function handleNewAuditStepperAction(
       return;
     }
 
+    const rawBody = await readRawBody(request);
+    log("info", "STEPPER_RAW_BODY_RECEIVED", {
+      action,
+      rawBody
+    });
+
+    let body: MinimalRunRequestBody = {};
+    try {
+      body = rawBody ? (JSON.parse(rawBody) as MinimalRunRequestBody) : {};
+    } catch {
+      body = {};
+    }
+
     const runId = body.runId?.trim() ?? "";
-    actionLogs.push(buildActionLog("RESPOND_NEXT_QUESTION_RUN_ID", {
+    log("info", "STEPPER_RUN_ID_VALIDATION_STARTED", {
+      action,
       runId: runId || null
+    });
+
+    if (!runId) {
+      const payload = {
+        ok: false,
+        error: "MISSING_RUN_ID"
+      };
+
+      writeJson(response, 400, payload);
+      log("info", "STEPPER_RUN_ID_INVALID_RETURNED", {
+        action,
+        status: 400,
+        error: "MISSING_RUN_ID"
+      });
+      return;
+    }
+
+    if (!isValidUuid(runId)) {
+      const payload = {
+        ok: false,
+        error: "INVALID_RUN_ID"
+      };
+
+      writeJson(response, 400, payload);
+      log("info", "STEPPER_RUN_ID_INVALID_RETURNED", {
+        action,
+        status: 400,
+        error: "INVALID_RUN_ID",
+        runId
+      });
+      return;
+    }
+
+    const actionLogs: WorkerActionLog[] = [];
+    actionLogs.push(buildActionLog("RESPOND_NEXT_QUESTION_RUN_ID", {
+      runId
+    }));
+    actionLogs.push(buildActionLog("RUN_ID_IS_VALID_UUID", {
+      runId,
+      valid: true
     }));
 
-    if (runId) {
-      const validUuid = isValidUuid(runId);
-      actionLogs.push(buildActionLog("RUN_ID_IS_VALID_UUID", {
-        runId,
-        valid: validUuid
-      }));
-
-      if (!validUuid) {
-        writeJson(response, 400, {
-          ok: false,
-          error: "INVALID_RUN_ID",
-          message: "runId debe ser un UUID valido",
-          actionLogs
-        });
-        return;
+    const run = await getSurveyRunDetails(runId).catch((error: unknown) => {
+      if (
+        error &&
+        typeof error === "object" &&
+        "code" in error &&
+        (error as { code?: string }).code === "PGRST116"
+      ) {
+        return null;
       }
-
-      const run = await getSurveyRunDetails(runId).catch((error: unknown) => {
-        if (
-          error &&
-          typeof error === "object" &&
-          "code" in error &&
-          (error as { code?: string }).code === "PGRST116"
-        ) {
-          return null;
-        }
-        throw error;
+      throw error;
+    });
+    actionLogs.push(buildActionLog("STEPPER_SESSION_LOOKUP_RESULT", {
+      runId,
+      found: Boolean(run)
+    }));
+    if (!run) {
+      writeJson(response, 404, {
+        ok: false,
+        error: "RUN_SESSION_NOT_FOUND",
+        actionLogs
       });
-      actionLogs.push(buildActionLog("STEPPER_SESSION_LOOKUP_RESULT", {
-        runId,
-        found: Boolean(run)
-      }));
-      if (!run) {
-        writeJson(response, 404, {
-          ok: false,
-          error: "RUN_SESSION_NOT_FOUND",
-          actionLogs
-        });
-        return;
-      }
+      return;
     }
 
     const surveyUrl = body.surveyUrl?.trim() ?? "";
@@ -614,6 +701,166 @@ async function handleNewAuditStepperAction(
       cause,
       rawError
     });
+  }
+}
+
+async function handleNewAuditAnalyzeStorePhotos(request: IncomingMessage, response: ServerResponse) {
+  try {
+    let body: NewAuditAnalyzeStorePhotosRequestBody;
+    try {
+      body = (await readJsonBody(request)) as NewAuditAnalyzeStorePhotosRequestBody;
+    } catch {
+      writeInvalidPayload(response, "INVALID_PAYLOAD");
+      return;
+    }
+    const storePhotos = isVisualPhotoArray(body.storePhotos) ? body.storePhotos : [];
+    const generalInstructions = body.generalInstructions?.trim() ?? "";
+
+    if (storePhotos.length === 0) {
+      writeInvalidPayload(response, "MISSING_STORE_PHOTOS");
+      return;
+    }
+
+    if (!generalInstructions) {
+      writeInvalidPayload(response, "MISSING_GENERAL_INSTRUCTIONS");
+      return;
+    }
+
+    const result = await runAnalyzeStorePhotos({
+      storePhotos,
+      generalInstructions
+    });
+
+    writeJson(response, 200, result);
+  } catch (error) {
+    const message = error instanceof Error ? error.message : String(error);
+    if (message === "MISSING_STORE_PHOTOS" || message === "STORE_PHOTOS_WITHOUT_USABLE_URL" || message === "MISSING_GENERAL_INSTRUCTIONS") {
+      writeInvalidPayload(response, message);
+      return;
+    }
+    if (message === "MISSING_PROJECT_QUESTIONS" || message === "NO_ACTIVE_VISUAL_QUESTIONS" || message === "OPENAI_API_KEY_NOT_CONFIGURED") {
+      writeInvalidPayload(response, message, message === "OPENAI_API_KEY_NOT_CONFIGURED" ? 500 : 400);
+      return;
+    }
+
+    throw error;
+  }
+}
+
+async function handleNewAuditAnalyzeQuestionBank(request: IncomingMessage, response: ServerResponse) {
+  try {
+    let body: NewAuditAnalyzeQuestionBankRequestBody;
+    try {
+      body = (await readJsonBody(request)) as NewAuditAnalyzeQuestionBankRequestBody;
+    } catch {
+      writeInvalidPayload(response, "INVALID_PAYLOAD");
+      return;
+    }
+    const projectQuestions = isVisualQuestionArray(body.projectQuestions) ? body.projectQuestions : [];
+    const generalInstructions = body.generalInstructions?.trim() ?? "";
+
+    if (projectQuestions.length === 0) {
+      writeInvalidPayload(response, "MISSING_PROJECT_QUESTIONS");
+      return;
+    }
+
+    if (!generalInstructions) {
+      writeInvalidPayload(response, "MISSING_GENERAL_INSTRUCTIONS");
+      return;
+    }
+
+    const result = await runAnalyzeQuestionBank({
+      projectQuestions,
+      generalInstructions
+    });
+
+    writeJson(response, 200, result);
+  } catch (error) {
+    const message = error instanceof Error ? error.message : String(error);
+    if (
+      message === "MISSING_PROJECT_QUESTIONS" ||
+      message === "NO_ACTIVE_VISUAL_QUESTIONS" ||
+      message === "MISSING_GENERAL_INSTRUCTIONS" ||
+      message === "MISSING_REFERENCE_IMAGE_FOR_QUESTION_IDS:" ||
+      message.startsWith("MISSING_REFERENCE_IMAGE_FOR_QUESTION_IDS:")
+    ) {
+      writeInvalidPayload(response, message);
+      return;
+    }
+
+    if (message === "OPENAI_API_KEY_NOT_CONFIGURED") {
+      writeInvalidPayload(response, message, 500);
+      return;
+    }
+
+    throw error;
+  }
+}
+
+async function handleNewAuditAnswerQuestions(request: IncomingMessage, response: ServerResponse) {
+  try {
+    let body: NewAuditAnswerQuestionsRequestBody;
+    try {
+      body = (await readJsonBody(request)) as NewAuditAnswerQuestionsRequestBody;
+    } catch {
+      writeInvalidPayload(response, "INVALID_PAYLOAD");
+      return;
+    }
+    const questionUnderstanding = isVisualQuestionUnderstandingArray(body.questionUnderstanding)
+      ? body.questionUnderstanding
+      : [];
+    const storePhotos = isVisualPhotoArray(body.storePhotos) ? body.storePhotos : [];
+    const knowledgeBase = body.knowledgeBase ?? null;
+    const perPhotoAnalysis = Array.isArray(body.perPhotoAnalysis) ? body.perPhotoAnalysis : [];
+    const generalInstructions = body.generalInstructions?.trim() ?? "";
+
+    if (questionUnderstanding.length === 0) {
+      writeInvalidPayload(response, "MISSING_QUESTION_UNDERSTANDING");
+      return;
+    }
+
+    if (storePhotos.length === 0) {
+      writeInvalidPayload(response, "MISSING_STORE_PHOTOS");
+      return;
+    }
+
+    if (!knowledgeBase) {
+      writeInvalidPayload(response, "MISSING_KNOWLEDGE_BASE");
+      return;
+    }
+
+    if (!generalInstructions) {
+      writeInvalidPayload(response, "MISSING_GENERAL_INSTRUCTIONS");
+      return;
+    }
+
+    const result = await runAnswerQuestions({
+      questionUnderstanding,
+      storePhotos,
+      knowledgeBase,
+      perPhotoAnalysis,
+      generalInstructions
+    });
+
+    writeJson(response, 200, result);
+  } catch (error) {
+    const message = error instanceof Error ? error.message : String(error);
+    if (
+      message === "MISSING_QUESTION_UNDERSTANDING" ||
+      message === "MISSING_STORE_PHOTOS" ||
+      message === "MISSING_KNOWLEDGE_BASE" ||
+      message === "MISSING_GENERAL_INSTRUCTIONS"
+    ) {
+      writeInvalidPayload(response, message);
+      return;
+    }
+
+    if (message === "OPENAI_API_KEY_NOT_CONFIGURED") {
+      writeInvalidPayload(response, message, 500);
+      return;
+    }
+
+    throw error;
   }
 }
 
@@ -840,6 +1087,21 @@ const server = createServer(async (request, response) => {
 
     if (method === "POST" && url.pathname === "/new-audit/continue-next-question") {
       await handleNewAuditStepperAction(request, response, "continue-next-question");
+      return;
+    }
+
+    if (method === "POST" && url.pathname === "/new-audit/analyze-store-photos") {
+      await handleNewAuditAnalyzeStorePhotos(request, response);
+      return;
+    }
+
+    if (method === "POST" && url.pathname === "/new-audit/analyze-question-bank") {
+      await handleNewAuditAnalyzeQuestionBank(request, response);
+      return;
+    }
+
+    if (method === "POST" && url.pathname === "/new-audit/answer-questions") {
+      await handleNewAuditAnswerQuestions(request, response);
       return;
     }
 
