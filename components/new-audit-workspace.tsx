@@ -755,6 +755,225 @@ async function compressReferenceImage(file: File) {
   }
 }
 
+async function downloadRemoteReferenceImage(url: string) {
+  const startedAt = Date.now();
+  const response = await fetch(url, {
+    method: "GET",
+    cache: "no-store"
+  });
+
+  if (!response.ok) {
+    throw new Error(`No se pudo descargar la referencia remota (${response.status}).`);
+  }
+
+  const blob = await response.blob();
+  const contentType = blob.type || response.headers.get("content-type") || "image/jpeg";
+  const fileName = (() => {
+    try {
+      const parsed = new URL(url);
+      const lastSegment = parsed.pathname.split("/").filter(Boolean).pop() || "reference-image";
+      return lastSegment.includes(".") ? lastSegment : `${lastSegment}.jpg`;
+    } catch {
+      return "reference-image.jpg";
+    }
+  })();
+
+  return {
+    file: new File([blob], fileName, { type: contentType }),
+    originalSizeBytes: blob.size,
+    contentType,
+    downloadMs: Date.now() - startedAt
+  };
+}
+
+async function normalizeVisualReferencesForAnalysis(
+  questions: ProjectQuestion[],
+  referenceImageSessions: Record<number, ReferenceImageSession>,
+  log: (message: string, detail?: unknown) => void
+) {
+  const referenceCache = new Map<string, string>();
+  const uniqueRemoteReferenceUrls = Array.from(
+    new Set(
+      questions
+        .map((question) => question.referenceImageUrl?.trim() ?? "")
+        .filter((value) => Boolean(value) && !value.startsWith("data:"))
+    )
+  );
+  const downloadedRemoteReferences = new Set<string>();
+  let reusedRemoteReferenceCount = 0;
+  const startedAt = Date.now();
+
+  log("REFERENCE_NORMALIZATION_STARTED", {
+    questionCount: questions.length,
+    activeQuestionCount: questions.filter((question) => question.active !== false).length,
+    uniqueRemoteReferenceCount: uniqueRemoteReferenceUrls.length
+  });
+
+  const normalizedQuestions: SerializedVisualQuestion[] = [];
+  let totalOriginalSizeBytes = 0;
+  let totalCompressedSizeBytes = 0;
+
+  for (const question of questions) {
+    const sessionImage = referenceImageSessions[question.id];
+    const directDataUrl = question.referenceImageDataUrl?.trim() ?? "";
+    const referenceUrl = question.referenceImageUrl?.trim() ?? "";
+
+    if (sessionImage) {
+      const compressionStartedAt = Date.now();
+      const compressed = await compressReferenceImage(sessionImage.file);
+      totalCompressedSizeBytes += compressed.payloadBytes;
+      log("REFERENCE_LOCAL_COMPRESSED", {
+        questionId: question.id,
+        referenceUrl: sessionImage.previewUrl,
+        originalSizeBytes: sessionImage.file.size,
+        compressedSizeBytes: compressed.payloadBytes,
+        width: compressed.width,
+        height: compressed.height,
+        compressionMs: Date.now() - compressionStartedAt,
+        source: "local-file"
+      });
+      normalizedQuestions.push({
+        id: question.id,
+        physicalNumber: question.physicalNumber,
+        active: question.active ?? true,
+        text: question.text || undefined,
+        referenceImageUrl: undefined,
+        referenceImageDataUrl: compressed.dataUrl,
+        specificInstructions: question.specificInstructions || undefined,
+        expectedOptions: question.expectedOptions
+      });
+      continue;
+    }
+
+    if (directDataUrl) {
+      if (referenceUrl && !referenceUrl.startsWith("data:")) {
+        referenceCache.set(referenceUrl, directDataUrl);
+      }
+      normalizedQuestions.push({
+        id: question.id,
+        physicalNumber: question.physicalNumber,
+        active: question.active ?? true,
+        text: question.text || undefined,
+        referenceImageUrl: undefined,
+        referenceImageDataUrl: directDataUrl,
+        specificInstructions: question.specificInstructions || undefined,
+        expectedOptions: question.expectedOptions
+      });
+      continue;
+    }
+
+    if (!referenceUrl) {
+      normalizedQuestions.push({
+        id: question.id,
+        physicalNumber: question.physicalNumber,
+        active: question.active ?? true,
+        text: question.text || undefined,
+        referenceImageUrl: undefined,
+        referenceImageDataUrl: undefined,
+        specificInstructions: question.specificInstructions || undefined,
+        expectedOptions: question.expectedOptions
+      });
+      continue;
+    }
+
+    if (referenceUrl.startsWith("data:")) {
+      referenceCache.set(referenceUrl, referenceUrl);
+      normalizedQuestions.push({
+        id: question.id,
+        physicalNumber: question.physicalNumber,
+        active: question.active ?? true,
+        text: question.text || undefined,
+        referenceImageUrl: undefined,
+        referenceImageDataUrl: referenceUrl,
+        specificInstructions: question.specificInstructions || undefined,
+        expectedOptions: question.expectedOptions
+      });
+      continue;
+    }
+
+    const cachedDataUrl = referenceCache.get(referenceUrl);
+    if (cachedDataUrl) {
+      reusedRemoteReferenceCount += 1;
+      normalizedQuestions.push({
+        id: question.id,
+        physicalNumber: question.physicalNumber,
+        active: question.active ?? true,
+        text: question.text || undefined,
+        referenceImageUrl: undefined,
+        referenceImageDataUrl: cachedDataUrl,
+        specificInstructions: question.specificInstructions || undefined,
+        expectedOptions: question.expectedOptions
+      });
+      continue;
+    }
+
+    try {
+      log("REFERENCE_REMOTE_DOWNLOAD_STARTED", {
+        questionId: question.id,
+        referenceUrl,
+        uniqueRemoteReferenceCount: uniqueRemoteReferenceUrls.length
+      });
+
+      const downloaded = await downloadRemoteReferenceImage(referenceUrl);
+      totalOriginalSizeBytes += downloaded.originalSizeBytes;
+      log("REFERENCE_REMOTE_DOWNLOAD_COMPLETED", {
+        questionId: question.id,
+        referenceUrl,
+        originalSizeBytes: downloaded.originalSizeBytes,
+        contentType: downloaded.contentType,
+        downloadMs: downloaded.downloadMs,
+        questionCountForReference: questions.filter((item) => (item.referenceImageUrl?.trim() ?? "") === referenceUrl).length
+      });
+
+      const compressionStartedAt = Date.now();
+      const compressed = await compressReferenceImage(downloaded.file);
+      totalCompressedSizeBytes += compressed.payloadBytes;
+      log("REFERENCE_REMOTE_COMPRESSED", {
+        questionId: question.id,
+        referenceUrl,
+        originalSizeBytes: downloaded.originalSizeBytes,
+        compressedSizeBytes: compressed.payloadBytes,
+        width: compressed.width,
+        height: compressed.height,
+        compressionMs: Date.now() - compressionStartedAt,
+        source: "remote-url"
+      });
+
+      referenceCache.set(referenceUrl, compressed.dataUrl);
+      downloadedRemoteReferences.add(referenceUrl);
+      normalizedQuestions.push({
+        id: question.id,
+        physicalNumber: question.physicalNumber,
+        active: question.active ?? true,
+        text: question.text || undefined,
+        referenceImageUrl: undefined,
+        referenceImageDataUrl: compressed.dataUrl,
+        specificInstructions: question.specificInstructions || undefined,
+        expectedOptions: question.expectedOptions
+      });
+    } catch (error) {
+      log("REFERENCE_NORMALIZATION_FAILED", {
+        questionId: question.id,
+        referenceUrl,
+        message: error instanceof Error ? error.message : String(error)
+      });
+      throw new Error("REFERENCE_NORMALIZATION_FAILED");
+    }
+  }
+
+  log("REFERENCE_NORMALIZATION_COMPLETED", {
+    questionCount: questions.length,
+    uniqueRemoteReferenceCount: uniqueRemoteReferenceUrls.length,
+    downloadedReferenceCount: downloadedRemoteReferences.size,
+    reusedReferenceCount: reusedRemoteReferenceCount,
+    originalSizeBytes: totalOriginalSizeBytes,
+    compressedSizeBytes: totalCompressedSizeBytes,
+    durationMs: Date.now() - startedAt
+  });
+
+  return normalizedQuestions;
+}
+
 function normalizeProjectQuestion(input: Partial<ProjectQuestion>, index: number): ProjectQuestion {
   const normalizedInput = input as Partial<ProjectQuestion> & { questionId?: number };
   return {
@@ -2140,31 +2359,6 @@ export function NewAuditWorkspace() {
     };
   }
 
-  async function serializeVisualQuestions(questions: ProjectQuestion[]) {
-    return Promise.all(
-      questions.map(async (question) => {
-        const sessionImage = referenceImageSessions[question.id];
-        let referenceImageDataUrl: string | undefined;
-
-        if (sessionImage) {
-          const compressed = await compressReferenceImage(sessionImage.file);
-          referenceImageDataUrl = compressed.dataUrl;
-        }
-
-        return {
-          id: question.id,
-          physicalNumber: question.physicalNumber,
-          active: question.active ?? true,
-          text: question.text || undefined,
-          referenceImageUrl: sessionImage ? undefined : question.referenceImageUrl || undefined,
-          referenceImageDataUrl,
-          specificInstructions: question.specificInstructions || undefined,
-          expectedOptions: question.expectedOptions
-        } satisfies SerializedVisualQuestion;
-      })
-    );
-  }
-
   function buildStorePhotosForVisualAnalysis() {
     return imageLinks.map((image) => ({
       index: image.index,
@@ -2747,7 +2941,11 @@ export function NewAuditWorkspace() {
       );
       setProjectQuestions(cleanedProjectQuestions);
 
-      const serializedQuestions = await serializeVisualQuestions(activeProjectQuestions);
+      const serializedQuestions = await normalizeVisualReferencesForAnalysis(
+        activeProjectQuestions,
+        referenceImageSessionsRef.current,
+        pushVisualLog
+      );
       serializedQuestionsRef.current = serializedQuestions;
       const storePhotos = buildStorePhotosForVisualAnalysis();
       storePhotosRef.current = storePhotos;
