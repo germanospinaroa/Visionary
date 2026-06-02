@@ -318,9 +318,9 @@ type VisualBatchState = {
 type VisualPipelineStageState = "pending" | "running" | "completed" | "failed";
 
 type VisualPipelineState = {
-  storePreScan: VisualPipelineStageState;
-  knowledgeBaseMerge: VisualPipelineStageState;
-  finalReview: VisualPipelineStageState;
+  phaseAQuestionBank: VisualPipelineStageState;
+  phaseBStoreAnalysis: VisualPipelineStageState;
+  phaseCAnswers: VisualPipelineStageState;
   batchStates: VisualBatchState[];
   answeredCount: number;
   needsReviewCount: number;
@@ -893,11 +893,11 @@ function splitIntoChunks<T>(items: T[], chunkSize: number) {
   return chunks;
 }
 
-function createEmptyPipelineState(): VisualPipelineState {
+function createEmptyVisualPipelineV2State(): VisualPipelineState {
   return {
-    storePreScan: "pending",
-    knowledgeBaseMerge: "pending",
-    finalReview: "pending",
+    phaseAQuestionBank: "pending",
+    phaseBStoreAnalysis: "pending",
+    phaseCAnswers: "pending",
     batchStates: [],
     answeredCount: 0,
     needsReviewCount: 0,
@@ -1011,7 +1011,7 @@ function mapVisualPipelineV2BatchState(
   };
 }
 
-function buildFinalReviewState(questions: ProjectQuestion[], batchStates: VisualBatchState[]): VisualPipelineState {
+function buildVisualPipelineV2State(questions: ProjectQuestion[], batchStates: VisualBatchState[]): VisualPipelineState {
   const activeQuestions = questions.filter((question) => question.active !== false && hasRealQuestionReference(question));
   const answeredCount = activeQuestions.filter((question) => question.status === "answered").length;
   const needsReviewCount = activeQuestions.filter((question) => question.status === "needs_review").length;
@@ -1026,15 +1026,45 @@ function buildFinalReviewState(questions: ProjectQuestion[], batchStates: Visual
     }));
 
   return {
-    storePreScan: "completed",
-    knowledgeBaseMerge: "completed",
-    finalReview: batchFailures.length > 0 ? "failed" : "completed",
+    phaseAQuestionBank: "completed",
+    phaseBStoreAnalysis: "completed",
+    phaseCAnswers: batchFailures.length > 0 ? "failed" : "completed",
     batchStates,
     answeredCount,
     needsReviewCount,
     pendingCount,
     photosUsedCount,
     batchFailures
+  };
+}
+
+function buildVisualPipelineV2Diagnostic(input: {
+  pipelineState: VisualPipelineState;
+  questionCount: number;
+  photoCount: number;
+}) {
+  const status =
+    input.pipelineState.phaseCAnswers === "completed" && input.pipelineState.pendingCount === 0
+      ? "completed"
+      : input.pipelineState.phaseAQuestionBank === "failed" ||
+          input.pipelineState.phaseBStoreAnalysis === "failed" ||
+          input.pipelineState.phaseCAnswers === "failed"
+        ? "failed"
+        : input.pipelineState.phaseAQuestionBank === "running" ||
+            input.pipelineState.phaseBStoreAnalysis === "running" ||
+            input.pipelineState.phaseCAnswers === "running"
+          ? "running"
+          : "pending";
+
+  return {
+    pipelineVersion: "v2",
+    status,
+    questionCount: input.questionCount,
+    photoCount: input.photoCount,
+    answeredCount: input.pipelineState.answeredCount,
+    needsReviewCount: input.pipelineState.needsReviewCount,
+    pendingCount: input.pipelineState.pendingCount,
+    batchStates: input.pipelineState.batchStates
   };
 }
 
@@ -1288,7 +1318,7 @@ export function NewAuditWorkspace() {
   const [questionUnderstanding, setQuestionUnderstanding] = useState<VisualQuestionUnderstanding[]>([]);
   const [questionUnderstandingFingerprint, setQuestionUnderstandingFingerprint] = useState<string | null>(null);
   const [visualAnalysisLogs, setVisualAnalysisLogs] = useState<VisualAnalysisLog[]>([]);
-  const [visualPipelineState, setVisualPipelineState] = useState<VisualPipelineState>(createEmptyPipelineState());
+  const [visualPipelineState, setVisualPipelineState] = useState<VisualPipelineState>(createEmptyVisualPipelineV2State());
   const importJsonRef = useRef<HTMLInputElement | null>(null);
   const referenceImageSessionsRef = useRef<Record<number, ReferenceImageSession>>({});
   const serializedQuestionsRef = useRef<SerializedVisualQuestion[]>([]);
@@ -1670,7 +1700,7 @@ export function NewAuditWorkspace() {
     setSurveyAnswering(false);
     setSurveyCompleting(false);
     setSurveySubmitting(false);
-    setVisualPipelineState(createEmptyPipelineState());
+    setVisualPipelineState(createEmptyVisualPipelineV2State());
     serializedQuestionsRef.current = [];
     storePhotosRef.current = [];
     setLastVisualRequestMeta({
@@ -2434,8 +2464,7 @@ export function NewAuditWorkspace() {
     setVisualPipelineState((current) => ({
       ...current,
       batchStates: nextBatchStates,
-      knowledgeBaseMerge: current.storePreScan === "completed" ? "running" : current.knowledgeBaseMerge,
-      finalReview: "running"
+      phaseCAnswers: current.phaseBStoreAnalysis === "completed" ? "running" : current.phaseCAnswers
     }));
 
     for (let batchIndex = input.startBatchIndex; batchIndex < chunks.length; batchIndex += 1) {
@@ -2496,7 +2525,7 @@ export function NewAuditWorkspace() {
         );
         setVisualPipelineState((current) => ({
           ...current,
-          knowledgeBaseMerge: "running",
+          phaseCAnswers: "running",
           batchStates: nextBatchStates
         }));
         pushVisualLog(
@@ -2514,11 +2543,11 @@ export function NewAuditWorkspace() {
         if (batchOutcome.status !== "completed") {
           setPreviewError(batchOutcome.error);
           setVisualPipelineState((current) => {
-            const finalState = buildFinalReviewState(workingQuestions, nextBatchStates);
+            const finalState = buildVisualPipelineV2State(workingQuestions, nextBatchStates);
             return {
               ...current,
               ...finalState,
-              knowledgeBaseMerge: "failed"
+              phaseCAnswers: "failed"
             };
           });
           setVisualAnalysisMessage(
@@ -2527,7 +2556,7 @@ export function NewAuditWorkspace() {
           return {
             workingQuestions,
             batchStates: nextBatchStates,
-            batchFailures: buildFinalReviewState(workingQuestions, nextBatchStates).batchFailures
+            batchFailures: buildVisualPipelineV2State(workingQuestions, nextBatchStates).batchFailures
           };
         }
       } catch (error) {
@@ -2567,11 +2596,11 @@ export function NewAuditWorkspace() {
         setPreviewError(errorDetails);
         setProjectQuestions([...workingQuestions]);
         setVisualPipelineState((current) => {
-          const finalState = buildFinalReviewState(workingQuestions, nextBatchStates);
+          const finalState = buildVisualPipelineV2State(workingQuestions, nextBatchStates);
           return {
             ...current,
             ...finalState,
-            knowledgeBaseMerge: "failed"
+            phaseCAnswers: "failed"
           };
         });
         pushVisualLog("QUESTION_BATCH_FAILED", {
@@ -2584,12 +2613,12 @@ export function NewAuditWorkspace() {
         return {
           workingQuestions,
           batchStates: nextBatchStates,
-          batchFailures: buildFinalReviewState(workingQuestions, nextBatchStates).batchFailures
+          batchFailures: buildVisualPipelineV2State(workingQuestions, nextBatchStates).batchFailures
         };
       }
     }
 
-    const finalPipelineState = buildFinalReviewState(workingQuestions, nextBatchStates);
+    const finalPipelineState = buildVisualPipelineV2State(workingQuestions, nextBatchStates);
     setVisualPipelineState(finalPipelineState);
     setKnowledgeBase((current) => ({
       ...current,
@@ -2672,11 +2701,11 @@ export function NewAuditWorkspace() {
         batch.batchNumber === batchNumber ? { ...batch, status: retryOutcome.status, error: retryOutcome.error } : batch
       );
       setVisualPipelineState((current) => {
-        const finalState = buildFinalReviewState(retryOutcome.workingQuestions, nextBatchStates);
+        const finalState = buildVisualPipelineV2State(retryOutcome.workingQuestions, nextBatchStates);
         return {
           ...current,
           ...finalState,
-          knowledgeBaseMerge: retryOutcome.status === "completed" ? "running" : "failed"
+          phaseCAnswers: retryOutcome.status === "completed" ? "running" : "failed"
         };
       });
       setPreviewError(retryOutcome.error);
@@ -2701,7 +2730,7 @@ export function NewAuditWorkspace() {
     setVisualAnalysisMessage("Analizando visualmente...");
     setPreviewError(null);
     setVisualAnalysisLogs([]);
-    setVisualPipelineState(createEmptyPipelineState());
+    setVisualPipelineState(createEmptyVisualPipelineV2State());
     setPerPhotoAnalysis([]);
     setKnowledgeBase(buildEmptyKnowledgeBase());
     setQuestionUnderstanding([]);
@@ -2728,9 +2757,9 @@ export function NewAuditWorkspace() {
       let nextBatchStates = initialBatchStates.map((batch) => ({ ...batch }));
 
       setVisualPipelineState({
-        storePreScan: "pending",
-        knowledgeBaseMerge: "pending",
-        finalReview: "pending",
+        phaseAQuestionBank: "pending",
+        phaseBStoreAnalysis: "pending",
+        phaseCAnswers: "pending",
         batchStates: initialBatchStates,
         answeredCount: 0,
         needsReviewCount: 0,
@@ -2757,6 +2786,10 @@ export function NewAuditWorkspace() {
           },
           onPhaseACompleted: (phaseAResult) => {
             setQuestionUnderstanding(phaseAResult.questionUnderstanding);
+            setVisualPipelineState((current) => ({
+              ...current,
+              phaseAQuestionBank: "completed"
+            }));
           },
           onPhaseBCompleted: (phaseBResult) => {
             workingKnowledgeBase = {
@@ -2767,9 +2800,9 @@ export function NewAuditWorkspace() {
             setKnowledgeBase(workingKnowledgeBase);
             setVisualPipelineState((current) => ({
               ...current,
-              storePreScan: "completed",
-              knowledgeBaseMerge: "running",
-              finalReview: "running"
+              phaseAQuestionBank: "completed",
+              phaseBStoreAnalysis: "completed",
+              phaseCAnswers: "pending"
             }));
             setVisualAnalysisMessage("Fase B completada.");
           },
@@ -2781,9 +2814,9 @@ export function NewAuditWorkspace() {
             );
             setVisualPipelineState((current) => ({
               ...current,
-              storePreScan: "completed",
-              knowledgeBaseMerge: "running",
-              finalReview: "running",
+              phaseAQuestionBank: "completed",
+              phaseBStoreAnalysis: "completed",
+              phaseCAnswers: "running",
               batchStates: nextBatchStates
             }));
             setProjectQuestions((current) =>
@@ -2809,10 +2842,10 @@ export function NewAuditWorkspace() {
             setProjectQuestions([...workingQuestions]);
             setKnowledgeBase(workingKnowledgeBase);
             setVisualPipelineState({
-              ...buildFinalReviewState(workingQuestions, nextBatchStates),
-              storePreScan: "completed",
-              knowledgeBaseMerge: "running",
-              finalReview: "running"
+              ...buildVisualPipelineV2State(workingQuestions, nextBatchStates),
+              phaseAQuestionBank: "completed",
+              phaseBStoreAnalysis: "completed",
+              phaseCAnswers: "running"
             });
             setVisualAnalysisMessage(`Batch ${batchState.batchNumber}/${batchState.totalBatches} completado`);
           },
@@ -2834,10 +2867,10 @@ export function NewAuditWorkspace() {
             setProjectQuestions([...workingQuestions]);
             setKnowledgeBase(workingKnowledgeBase);
             setVisualPipelineState({
-              ...buildFinalReviewState(workingQuestions, nextBatchStates),
-              storePreScan: "completed",
-              knowledgeBaseMerge: "failed",
-              finalReview: "failed"
+              ...buildVisualPipelineV2State(workingQuestions, nextBatchStates),
+              phaseAQuestionBank: "completed",
+              phaseBStoreAnalysis: "completed",
+              phaseCAnswers: "failed"
             });
             setVisualAnalysisMessage(`Batch ${batchState.batchNumber}/${batchState.totalBatches} failed`);
           }
@@ -2858,10 +2891,10 @@ export function NewAuditWorkspace() {
       setKnowledgeBase(workingKnowledgeBase);
       setProjectQuestions(workingQuestions);
       setVisualPipelineState({
-        ...buildFinalReviewState(workingQuestions, nextBatchStates),
-        storePreScan: "completed",
-        knowledgeBaseMerge: "completed",
-        finalReview: "completed"
+        ...buildVisualPipelineV2State(workingQuestions, nextBatchStates),
+        phaseAQuestionBank: "completed",
+        phaseBStoreAnalysis: "completed",
+        phaseCAnswers: "completed"
       });
       setVisualAnalysisMessage("PIPELINE_V2_COMPLETED");
     } catch (error) {
@@ -2910,21 +2943,24 @@ export function NewAuditWorkspace() {
         setKnowledgeBase(partialKnowledgeBase);
         setProjectQuestions(partialQuestions);
         setVisualPipelineState({
-          ...buildFinalReviewState(partialQuestions, partialBatchStates),
-          storePreScan:
+          ...buildVisualPipelineV2State(partialQuestions, partialBatchStates),
+          phaseAQuestionBank:
             errorCode === "PHASE_A_FAILED"
-              ? "pending"
-              : errorCode === "PHASE_B_FAILED"
-                ? "failed"
-                : "completed",
-          knowledgeBaseMerge:
-            errorCode === "PHASE_B_FAILED" || errorCode === "PHASE_C_FAILED" ? "failed" : "pending",
-          finalReview: "failed"
+              ? "failed"
+              : "completed",
+          phaseBStoreAnalysis:
+            errorCode === "PHASE_A_FAILED" ? "pending" : errorCode === "PHASE_B_FAILED" ? "failed" : "completed",
+          phaseCAnswers:
+            errorCode === "PHASE_C_FAILED"
+              ? "failed"
+              : errorCode === "PHASE_A_FAILED" || errorCode === "PHASE_B_FAILED"
+                ? "pending"
+                : "failed"
         });
       } else {
         setVisualPipelineState((current) => ({
           ...current,
-          finalReview: "failed"
+          phaseCAnswers: "failed"
         }));
       }
       pushVisualLog("error", {
@@ -4167,16 +4203,16 @@ export function NewAuditWorkspace() {
               </p>
             </div>
             <div className="audit-result-group">
-              <span>Store Pre-Scan</span>
-              <p>{visualPipelineState.storePreScan}</p>
+              <span>Fase A · Question Bank</span>
+              <p>{visualPipelineState.phaseAQuestionBank}</p>
             </div>
             <div className="audit-result-group">
-              <span>Knowledge Base Merge</span>
-              <p>{visualPipelineState.knowledgeBaseMerge}</p>
+              <span>Fase B · Store Analysis</span>
+              <p>{visualPipelineState.phaseBStoreAnalysis}</p>
             </div>
             <div className="audit-result-group">
-              <span>Final Review</span>
-              <p>{visualPipelineState.finalReview}</p>
+              <span>Fase C · Answer Questions</span>
+              <p>{visualPipelineState.phaseCAnswers}</p>
             </div>
             <div className="audit-result-group">
               <span>Resumen final</span>
@@ -4247,23 +4283,18 @@ export function NewAuditWorkspace() {
 
         <section className="audit-results-panel">
           <div className="audit-panel-head">
-            <h2>Debug técnico</h2>
+            <h2>Diagnóstico V2</h2>
           </div>
           <article className="audit-result-card">
             <details className="audit-collapsible">
               <summary>Ver diagnóstico técnico</summary>
               <pre>
                 {JSON.stringify(
-                  {
-                    payloadSizeBytes: lastVisualRequestMeta.payloadSizeBytes,
+                  buildVisualPipelineV2Diagnostic({
+                    pipelineState: visualPipelineState,
                     photoCount: imageLinks.length,
-                    questionCount: activeProjectQuestions.length,
-                    status: lastVisualRequestMeta.status,
-                    visualPipelineState,
-                    currentStep: activeRun?.currentStep ?? null,
-                    finalState: activeRun?.finalState ?? null,
-                    questionMatchDebug: activeRun?.questionMatchDebug ?? null
-                  },
+                    questionCount: activeProjectQuestions.length
+                  }),
                   null,
                   2
                 )}
