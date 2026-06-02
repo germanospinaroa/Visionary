@@ -1876,6 +1876,57 @@ export function NewAuditWorkspace() {
     ]);
   }
 
+  function relayLiveRunActionLogs(
+    actionLogs: Array<{ event?: string; detail?: unknown }> | undefined,
+    options: {
+      includeNavigationCompleted?: boolean;
+    } = {}
+  ) {
+    if (!Array.isArray(actionLogs)) {
+      return;
+    }
+
+    let navigationCompletedLogged = false;
+
+    actionLogs.forEach((entry) => {
+      if (typeof entry?.event !== "string" || !entry.event) {
+        return;
+      }
+
+      pushVisualLog(entry.event, entry.detail);
+
+      if (options.includeNavigationCompleted && !navigationCompletedLogged && entry.event === "VISIBLE_QUESTION_EXTRACTED") {
+        navigationCompletedLogged = true;
+        pushVisualLog("PAGE_NAVIGATION_COMPLETED", entry.detail);
+      }
+
+      if (entry.event === "VISIBLE_QUESTION_EXTRACTED") {
+        pushVisualLog("VISIBLE_QUESTION_DETECTED", entry.detail);
+      }
+
+      if (entry.event === "QUESTION_MATCHED") {
+        pushVisualLog("QUESTION_MATCHED_TO_RESULT", entry.detail);
+      }
+
+      if (entry.event === "ANSWER_SELECTED") {
+        pushVisualLog("ANSWER_OPTION_SELECTED", entry.detail);
+        pushVisualLog("ANSWER_CONFIRMED_ON_PAGE", entry.detail);
+      }
+
+      if (entry.event === "CONTINUE_CLICKED") {
+        pushVisualLog("NEXT_QUESTION_CLICKED", entry.detail);
+      }
+
+      if (entry.event === "NEEDS_REVIEW_OPTION_MATCH") {
+        pushVisualLog("OPTION_NOT_FOUND", entry.detail);
+      }
+
+      if (entry.event === "NEEDS_REVIEW_QUESTION_MATCH") {
+        pushVisualLog("VISIBLE_QUESTION_NOT_FOUND", entry.detail);
+      }
+    });
+  }
+
   function registerVisualAnalyzeInteraction(eventName: string, source: string) {
     const detail = {
       source,
@@ -3214,10 +3265,15 @@ export function NewAuditWorkspace() {
 
   async function handleAnswerSurveyUntilPhoto(source = "unknown") {
     pushVisualLog("SURVEY_ANSWERING_STARTED", { source });
+    pushVisualLog("LIVE_RUN_STARTED", { source, mode: "single_question_live" });
 
     if (!canAnswerSurveyUntilPhoto) {
       setPreviewError({ message: "Primero debes tener questionResults calculadas para las preguntas activas." });
       setVisualAnalysisMessage("Faltan questionResults para responder la encuesta.");
+      pushVisualLog("LIVE_RUN_FAILED", {
+        source,
+        reason: "question_results_missing"
+      });
       return;
     }
 
@@ -3232,6 +3288,14 @@ export function NewAuditWorkspace() {
     setVisualAnalysisMessage("Respondiendo siguiente pregunta...");
 
     try {
+      const isNewStepperSession = !activeRun?.stepperSessionId;
+      if (isNewStepperSession) {
+        pushVisualLog("PAGE_NAVIGATION_STARTED", {
+          surveyUrl,
+          storeCode: currentStore !== "Sin datos reales todavia" ? currentStore : firstStore
+        });
+      }
+
       pushVisualLog("RESPOND_NEXT_QUESTION_RUN_ID", {
         runId,
         activeRunId: activeRun?.id ?? null
@@ -3280,18 +3344,18 @@ export function NewAuditWorkspace() {
         payload && "body" in payload && payload.body && typeof payload.body === "object"
           ? (payload.body as { actionLogs?: Array<{ event?: string; detail?: unknown }> })
           : null;
-      if (Array.isArray(routeBody?.actionLogs)) {
-        routeBody.actionLogs.forEach((entry) => {
-          if (typeof entry?.event === "string" && entry.event) {
-            pushVisualLog(entry.event, entry.detail);
-          }
-        });
-      }
+      relayLiveRunActionLogs(routeBody?.actionLogs);
 
       if (!response.ok || !payload || !("payload" in payload) || !payload.payload) {
         if (routeBody && "error" in routeBody) {
           pushVisualLog("STEPPER_SESSION_LOOKUP_RESULT", routeBody);
         }
+        pushVisualLog("LIVE_RUN_FAILED", {
+          source,
+          endpoint: "/api/new-audit/respond-next-question",
+          status: response.status,
+          error: payload && "error" in payload && payload.error ? payload.error : "respond_next_question_failed"
+        });
         throw new Error(payload && "error" in payload && payload.error ? payload.error : "respond_next_question_failed");
       }
 
@@ -3318,11 +3382,9 @@ export function NewAuditWorkspace() {
         finalState: responsePayload.finalState ?? fallbackRun.finalState ?? null
       }));
 
-      if (Array.isArray(responsePayload.actionLogs)) {
-        responsePayload.actionLogs.forEach((entry) => {
-          pushVisualLog(entry.event, entry.detail);
-        });
-      }
+      relayLiveRunActionLogs(responsePayload.actionLogs, {
+        includeNavigationCompleted: isNewStepperSession
+      });
       if (responsePayload.currentQuestion) {
         pushVisualLog("extractCurrentSurveyQuestion", responsePayload.currentQuestion);
       }
@@ -3349,10 +3411,25 @@ export function NewAuditWorkspace() {
               body: responsePayload
             }
       );
+
+      if (!["WAITING_FOR_CONTINUE", "STEPPER_READY", "WAITING_FOR_PHOTO_SELECTION"].includes(responsePayload.finalState ?? "")) {
+        pushVisualLog("LIVE_RUN_FAILED", {
+          source,
+          finalState: responsePayload.finalState ?? null
+        });
+      }
     } catch (error) {
+      const errorMessage = error instanceof Error ? error.message : String(error);
+      if (errorMessage.includes("No se encontró el botón CONTINUAR")) {
+        pushVisualLog("NEXT_BUTTON_NOT_FOUND", { source, error: errorMessage });
+      }
+      pushVisualLog("LIVE_RUN_FAILED", {
+        source,
+        error: errorMessage
+      });
       setWorkspaceStatus("Failed");
       setPreviewError({
-        message: error instanceof Error ? error.message : String(error),
+        message: errorMessage,
         endpoint: "/api/new-audit/respond-next-question"
       });
       setVisualAnalysisMessage("No se pudo responder la siguiente pregunta.");
@@ -3387,6 +3464,12 @@ export function NewAuditWorkspace() {
         | null;
 
       if (!response.ok || !payload || !("payload" in payload) || !payload.payload) {
+        pushVisualLog("LIVE_RUN_FAILED", {
+          source,
+          endpoint: "/api/new-audit/continue-next-question",
+          status: response.status,
+          error: payload && "error" in payload && payload.error ? payload.error : "continue_next_question_failed"
+        });
         throw new Error(payload && "error" in payload && payload.error ? payload.error : "continue_next_question_failed");
       }
 
@@ -3408,11 +3491,7 @@ export function NewAuditWorkspace() {
         finalState: responsePayload.finalState ?? fallbackRun.finalState ?? null
       }));
 
-      if (Array.isArray(responsePayload.actionLogs)) {
-        responsePayload.actionLogs.forEach((entry) => {
-          pushVisualLog(entry.event, entry.detail);
-        });
-      }
+      relayLiveRunActionLogs(responsePayload.actionLogs);
 
       setWorkspaceStatus(["STEPPER_READY", "WAITING_FOR_PHOTO_SELECTION"].includes(responsePayload.finalState ?? "") ? "Ready" : "Failed");
       setVisualAnalysisMessage(
@@ -3432,10 +3511,30 @@ export function NewAuditWorkspace() {
               body: responsePayload
             }
       );
+
+      if (["STEPPER_READY", "WAITING_FOR_PHOTO_SELECTION"].includes(responsePayload.finalState ?? "")) {
+        pushVisualLog("LIVE_RUN_COMPLETED", {
+          source,
+          finalState: responsePayload.finalState ?? null
+        });
+      } else {
+        pushVisualLog("LIVE_RUN_FAILED", {
+          source,
+          finalState: responsePayload.finalState ?? null
+        });
+      }
     } catch (error) {
+      const errorMessage = error instanceof Error ? error.message : String(error);
+      if (errorMessage.includes("No se encontró el botón CONTINUAR")) {
+        pushVisualLog("NEXT_BUTTON_NOT_FOUND", { source, error: errorMessage });
+      }
+      pushVisualLog("LIVE_RUN_FAILED", {
+        source,
+        error: errorMessage
+      });
       setWorkspaceStatus("Failed");
       setPreviewError({
-        message: error instanceof Error ? error.message : String(error),
+        message: errorMessage,
         endpoint: "/api/new-audit/continue-next-question"
       });
       setVisualAnalysisMessage("No se pudo continuar a la siguiente pregunta.");

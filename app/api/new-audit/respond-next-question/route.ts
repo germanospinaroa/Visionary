@@ -64,7 +64,7 @@ export async function POST(request: Request) {
     return NextResponse.json({ error: "minimal_worker_not_configured", endpoint: null, status: 503, body: null }, { status: 503 });
   }
 
-  const endpoint = `${baseUrl}/new-audit/respond-next-question`;
+  const endpoint = `${baseUrl}/minimal-runs/answer-next-question`;
 
   try {
     const response = await fetch(endpoint, {
