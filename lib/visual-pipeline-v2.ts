@@ -314,7 +314,6 @@ export async function phaseAUnderstandQuestions(
 }> {
   const expectedQuestionIds = input.activeQuestions.map((question) => question.id);
   const understandingById = new Map<number, VisualQuestionUnderstanding>();
-  let remainingQuestions = [...input.activeQuestions];
   const startedAt = Date.now();
   const maxAttempts = input.phaseAMaxAttempts ?? DEFAULT_PHASE_A_MAX_ATTEMPTS;
 
@@ -323,45 +322,100 @@ export async function phaseAUnderstandQuestions(
     questionCount: expectedQuestionIds.length
   });
 
-  for (let attempt = 1; attempt <= maxAttempts; attempt += 1) {
-    if (attempt > 1) {
-      emitLog(input, "PHASE_A_RETRY_MISSING", {
-        attempt,
-        missingQuestionIds: remainingQuestions.map((question) => question.id)
-      });
-    }
+  for (const question of input.activeQuestions) {
+    let resolvedUnderstanding: VisualQuestionUnderstanding | null = null;
+    const questionStartedAt = Date.now();
 
-    const payload = {
-      projectQuestions: remainingQuestions,
-      generalInstructions: input.generalInstructions
-    };
-    let result: Awaited<
-      ReturnType<typeof postJson<{ questionUnderstanding: VisualQuestionUnderstanding[] }>>
-    >;
-    try {
-      result = await postJson<{ questionUnderstanding: VisualQuestionUnderstanding[] }>(
-        input,
-        "/api/new-audit/analyze-question-bank",
-        payload,
-        0,
-        remainingQuestions.length,
-        `Fase A excedio el timeout en el intento ${attempt}.`
-      );
-    } catch (error) {
-      const message = error instanceof Error ? error.message : "Fase A fallo.";
-      emitLog(input, "PHASE_A_FAILED", {
-        questionIds: expectedQuestionIds,
-        receivedQuestionIds: Array.from(understandingById.keys()),
-        missingQuestionIds: remainingQuestions.map((question) => question.id),
-        attempts: attempt,
-        durationMs: Date.now() - startedAt
+    for (let attempt = 1; attempt <= maxAttempts; attempt += 1) {
+      const receivedQuestionIdsBeforeAttempt = Array.from(understandingById.keys());
+      emitLog(input, attempt === 1 ? "PHASE_A_QUESTION_STARTED" : "PHASE_A_QUESTION_RETRY", {
+        questionId: question.id,
+        attempt,
+        receivedQuestionIds: receivedQuestionIdsBeforeAttempt,
+        durationMs: Date.now() - questionStartedAt
       });
-      if (error instanceof VisualPipelineV2Error) {
-        throw new VisualPipelineV2Error("PHASE_A_FAILED", message, {
-          ...error.detail,
+
+      const payload = {
+        projectQuestions: [question],
+        generalInstructions: input.generalInstructions
+      };
+
+      let result: Awaited<ReturnType<typeof postJson<{ questionUnderstanding: VisualQuestionUnderstanding[] }>>>;
+      try {
+        result = await postJson<{ questionUnderstanding: VisualQuestionUnderstanding[] }>(
+          input,
+          "/api/new-audit/analyze-question-bank",
+          payload,
+          0,
+          1,
+          `Fase A excedio el timeout para la pregunta ${question.id} en el intento ${attempt}.`
+        );
+      } catch (error) {
+        const message = error instanceof Error ? error.message : "Fase A fallo.";
+        if (attempt >= maxAttempts) {
+          const receivedQuestionIds = Array.from(understandingById.keys());
+          const missingQuestionIds = expectedQuestionIds.filter((questionId) => !receivedQuestionIds.includes(questionId));
+          emitLog(input, "PHASE_A_FAILED", {
+            questionId: question.id,
+            attempt,
+            questionIds: expectedQuestionIds,
+            receivedQuestionIds,
+            missingQuestionIds,
+            durationMs: Date.now() - startedAt
+          });
+
+          throw new VisualPipelineV2Error("PHASE_A_FAILED", message, {
+            expectedQuestionIds,
+            receivedQuestionIds,
+            missingQuestionIds,
+            partialResult: {
+              questionUnderstanding: Array.from(understandingById.values()),
+              knowledgeBase: null,
+              perPhotoAnalysis: [],
+              questionResults: [],
+              batchStates: []
+            }
+          });
+        }
+
+        continue;
+      }
+
+      const receivedQuestionIds = (result.parsed.questionUnderstanding ?? [])
+        .map((item) => item.questionId)
+        .filter((item): item is number => typeof item === "number");
+      const matchedUnderstanding = (result.parsed.questionUnderstanding ?? []).find(
+        (item) => item.questionId === question.id
+      );
+
+      if (matchedUnderstanding) {
+        understandingById.set(question.id, matchedUnderstanding);
+        resolvedUnderstanding = matchedUnderstanding;
+        emitLog(input, "PHASE_A_QUESTION_COMPLETED", {
+          questionId: question.id,
+          attempt,
+          receivedQuestionIds,
+          durationMs: Date.now() - questionStartedAt
+        });
+        break;
+      }
+
+      if (attempt >= maxAttempts) {
+        const currentReceivedQuestionIds = Array.from(understandingById.keys());
+        const missingQuestionIds = expectedQuestionIds.filter((questionId) => !currentReceivedQuestionIds.includes(questionId));
+        emitLog(input, "PHASE_A_FAILED", {
+          questionId: question.id,
+          attempt,
+          questionIds: expectedQuestionIds,
+          receivedQuestionIds: currentReceivedQuestionIds,
+          missingQuestionIds,
+          durationMs: Date.now() - startedAt
+        });
+
+        throw new VisualPipelineV2Error("PHASE_A_FAILED", `Fase A incompleta para la pregunta ${question.id}.`, {
           expectedQuestionIds,
-          receivedQuestionIds: Array.from(understandingById.keys()),
-          missingQuestionIds: remainingQuestions.map((question) => question.id),
+          receivedQuestionIds: currentReceivedQuestionIds,
+          missingQuestionIds,
           partialResult: {
             questionUnderstanding: Array.from(understandingById.values()),
             knowledgeBase: null,
@@ -371,11 +425,24 @@ export async function phaseAUnderstandQuestions(
           }
         });
       }
+    }
 
-      throw new VisualPipelineV2Error("PHASE_A_FAILED", message, {
+    if (!resolvedUnderstanding) {
+      const receivedQuestionIds = Array.from(understandingById.keys());
+      const missingQuestionIds = expectedQuestionIds.filter((questionId) => !receivedQuestionIds.includes(questionId));
+      emitLog(input, "PHASE_A_FAILED", {
+        questionId: question.id,
+        attempt: maxAttempts,
+        questionIds: expectedQuestionIds,
+        receivedQuestionIds,
+        missingQuestionIds,
+        durationMs: Date.now() - startedAt
+      });
+
+      throw new VisualPipelineV2Error("PHASE_A_FAILED", `Fase A incompleta para la pregunta ${question.id}.`, {
         expectedQuestionIds,
-        receivedQuestionIds: Array.from(understandingById.keys()),
-        missingQuestionIds: remainingQuestions.map((question) => question.id),
+        receivedQuestionIds,
+        missingQuestionIds,
         partialResult: {
           questionUnderstanding: Array.from(understandingById.values()),
           knowledgeBase: null,
@@ -385,73 +452,25 @@ export async function phaseAUnderstandQuestions(
         }
       });
     }
-
-    for (const item of result.parsed.questionUnderstanding ?? []) {
-      if (typeof item.questionId === "number") {
-        understandingById.set(item.questionId, item);
-      }
-    }
-
-    const mergedUnderstanding = expectedQuestionIds
-      .map((questionId) => understandingById.get(questionId))
-      .filter((item): item is VisualQuestionUnderstanding => Boolean(item));
-
-    const completion = (() => {
-      try {
-        return assertCompleteQuestionUnderstanding(expectedQuestionIds, mergedUnderstanding);
-      } catch (error) {
-        if (error instanceof VisualPipelineV2Error) {
-          return error.detail;
-        }
-
-        throw error;
-      }
-    })();
-
-    const missingQuestionIds = completion.missingQuestionIds ?? [];
-    if (missingQuestionIds.length === 0) {
-      emitLog(input, "PHASE_A_COMPLETED", {
-        questionIds: expectedQuestionIds,
-        receivedQuestionIds: completion.receivedQuestionIds ?? expectedQuestionIds,
-        missingQuestionIds: [],
-        durationMs: Date.now() - startedAt
-      });
-      return {
-        questionUnderstanding: mergedUnderstanding,
-        receivedQuestionIds: completion.receivedQuestionIds ?? expectedQuestionIds,
-        missingQuestionIds: []
-      };
-    }
-
-    remainingQuestions = input.activeQuestions.filter((question) => missingQuestionIds.includes(question.id));
   }
 
-  const partialUnderstanding = expectedQuestionIds
+  const finalUnderstanding = expectedQuestionIds
     .map((questionId) => understandingById.get(questionId))
     .filter((item): item is VisualQuestionUnderstanding => Boolean(item));
-  const receivedQuestionIds = partialUnderstanding.map((question) => question.questionId);
-  const missingQuestionIds = expectedQuestionIds.filter((questionId) => !receivedQuestionIds.includes(questionId));
+  const completion = assertCompleteQuestionUnderstanding(expectedQuestionIds, finalUnderstanding);
 
-  emitLog(input, "PHASE_A_FAILED", {
+  emitLog(input, "PHASE_A_COMPLETED", {
     questionIds: expectedQuestionIds,
-    receivedQuestionIds,
-    missingQuestionIds,
-    attempts: maxAttempts,
+    receivedQuestionIds: completion.receivedQuestionIds,
+    missingQuestionIds: completion.missingQuestionIds,
     durationMs: Date.now() - startedAt
   });
 
-  throw new VisualPipelineV2Error("PHASE_A_FAILED", `Fase A incompleta tras ${maxAttempts} intentos.`, {
-    expectedQuestionIds,
-    receivedQuestionIds,
-    missingQuestionIds,
-    partialResult: {
-      questionUnderstanding: partialUnderstanding,
-      knowledgeBase: null,
-      perPhotoAnalysis: [],
-      questionResults: [],
-      batchStates: []
-    }
-  });
+  return {
+    questionUnderstanding: finalUnderstanding,
+    receivedQuestionIds: completion.receivedQuestionIds,
+    missingQuestionIds: completion.missingQuestionIds
+  };
 }
 
 export async function phaseBAnalyzeStorePhotos(
