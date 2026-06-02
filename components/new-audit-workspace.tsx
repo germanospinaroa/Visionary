@@ -715,16 +715,25 @@ function loadImageFromUrl(url: string) {
   });
 }
 
-async function compressReferenceImage(file: File) {
+type CompressReferenceImageOptions = {
+  maxDimension?: number;
+  quality?: number;
+  maxBytes?: number;
+};
+
+async function compressReferenceImage(file: File, options: CompressReferenceImageOptions = {}) {
   if (!file.type.startsWith("image/")) {
     throw new Error("La referencia cargada no es una imagen válida.");
   }
 
+  const maxDimension = options.maxDimension ?? REFERENCE_IMAGE_MAX_DIMENSION;
+  const quality = options.quality ?? REFERENCE_IMAGE_JPEG_QUALITY;
+  const maxBytes = options.maxBytes ?? MAX_REFERENCE_IMAGE_BYTES;
   const sourceUrl = URL.createObjectURL(file);
 
   try {
     const image = await loadImageFromUrl(sourceUrl);
-    const scale = Math.min(1, REFERENCE_IMAGE_MAX_DIMENSION / Math.max(image.width, image.height));
+    const scale = Math.min(1, maxDimension / Math.max(image.width, image.height));
     const width = Math.max(1, Math.round(image.width * scale));
     const height = Math.max(1, Math.round(image.height * scale));
     const canvas = document.createElement("canvas");
@@ -737,10 +746,10 @@ async function compressReferenceImage(file: File) {
     }
 
     context.drawImage(image, 0, 0, width, height);
-    const dataUrl = canvas.toDataURL("image/jpeg", REFERENCE_IMAGE_JPEG_QUALITY);
+    const dataUrl = canvas.toDataURL("image/jpeg", quality);
     const payloadBytes = estimateUtf8Bytes(dataUrl);
 
-    if (payloadBytes > MAX_REFERENCE_IMAGE_BYTES) {
+    if (payloadBytes > maxBytes) {
       throw new Error("REFERENCE_IMAGE_TOO_LARGE");
     }
 
@@ -753,6 +762,31 @@ async function compressReferenceImage(file: File) {
   } finally {
     URL.revokeObjectURL(sourceUrl);
   }
+}
+
+async function compressReferenceImageToLimit(file: File) {
+  const attempts: CompressReferenceImageOptions[] = [
+    { maxDimension: 1400, quality: 0.72, maxBytes: Number.POSITIVE_INFINITY },
+    { maxDimension: 1200, quality: 0.65, maxBytes: Number.POSITIVE_INFINITY },
+    { maxDimension: 1000, quality: 0.6, maxBytes: Number.POSITIVE_INFINITY },
+    { maxDimension: 900, quality: 0.55, maxBytes: Number.POSITIVE_INFINITY },
+    { maxDimension: 800, quality: 0.5, maxBytes: Number.POSITIVE_INFINITY },
+    { maxDimension: 700, quality: 0.45, maxBytes: Number.POSITIVE_INFINITY },
+    { maxDimension: 600, quality: 0.4, maxBytes: Number.POSITIVE_INFINITY },
+    { maxDimension: 500, quality: 0.35, maxBytes: Number.POSITIVE_INFINITY },
+    { maxDimension: 400, quality: 0.3, maxBytes: Number.POSITIVE_INFINITY }
+  ];
+
+  let lastCompressed: Awaited<ReturnType<typeof compressReferenceImage>> | null = null;
+  for (const attempt of attempts) {
+    const compressed = await compressReferenceImage(file, attempt);
+    lastCompressed = compressed;
+    if (compressed.payloadBytes <= MAX_REFERENCE_IMAGE_BYTES) {
+      return compressed;
+    }
+  }
+
+  throw new Error("REFERENCE_IMAGE_TOO_LARGE");
 }
 
 async function downloadRemoteReferenceImage(url: string) {
@@ -820,7 +854,7 @@ async function normalizeVisualReferencesForAnalysis(
 
     if (sessionImage) {
       const compressionStartedAt = Date.now();
-      const compressed = await compressReferenceImage(sessionImage.file);
+      const compressed = await compressReferenceImageToLimit(sessionImage.file);
       totalCompressedSizeBytes += compressed.payloadBytes;
       log("REFERENCE_LOCAL_COMPRESSED", {
         questionId: question.id,
@@ -926,7 +960,7 @@ async function normalizeVisualReferencesForAnalysis(
       });
 
       const compressionStartedAt = Date.now();
-      const compressed = await compressReferenceImage(downloaded.file);
+      const compressed = await compressReferenceImageToLimit(downloaded.file);
       totalCompressedSizeBytes += compressed.payloadBytes;
       log("REFERENCE_REMOTE_COMPRESSED", {
         questionId: question.id,
