@@ -3,9 +3,16 @@
 import { useEffect, useMemo, useRef, useState } from "react";
 import type { ProjectQuestion } from "@/lib/new-audit-runtime";
 import type {
+  VisualQuestionResult,
   VisualQuestionUnderstanding,
   VisualStoreAnalysisResponse
 } from "@/lib/new-audit-visual-analysis";
+import {
+  VisualPipelineV2Error,
+  type VisualPipelineV2BatchState as VisualPipelineV2BatchStateResult,
+  type VisualPipelineV2QuestionInput,
+  runVisualAuditV2
+} from "@/lib/visual-pipeline-v2";
 
 type WorkspaceStatus = "Draft" | "Running" | "Ready" | "Failed";
 type PhotoLoadState = "pending" | "loaded" | "error";
@@ -956,6 +963,54 @@ function buildMergedKnowledgeBase(base: KnowledgeBase, questions: ProjectQuestio
   };
 }
 
+function applyQuestionResultsToQuestions(questions: ProjectQuestion[], questionResults: VisualQuestionResult[]) {
+  const resultsByQuestionId = new Map(questionResults.map((question) => [question.questionId, question]));
+
+  return questions.map((question) => {
+    const result = resultsByQuestionId.get(question.id);
+    if (!result) {
+      return question;
+    }
+
+    return {
+      ...question,
+      status: result.status,
+      suggestedAnswer: result.answer,
+      confidence: result.confidence,
+      reasoning: result.reasoning,
+      storePhotosUsed: result.storePhotosUsed,
+      evidence: result.evidence,
+      visualDiagnostic: result.visualDiagnostic
+    };
+  });
+}
+
+function buildVisualBatchStatesForV2(
+  questions: VisualPipelineV2QuestionInput[],
+  batchSize: number
+): VisualBatchState[] {
+  return splitIntoChunks(questions, batchSize).map((chunk, index, chunks) => ({
+    batchNumber: index + 1,
+    totalBatches: chunks.length,
+    questionIds: chunk.map((question) => question.id),
+    status: "pending",
+    error: null
+  }));
+}
+
+function mapVisualPipelineV2BatchState(
+  batchState: VisualPipelineV2BatchStateResult,
+  error: ErrorDetails | null = null
+): VisualBatchState {
+  return {
+    batchNumber: batchState.batchNumber,
+    totalBatches: batchState.totalBatches,
+    questionIds: batchState.questionIds,
+    status: batchState.status,
+    error
+  };
+}
+
 function buildFinalReviewState(questions: ProjectQuestion[], batchStates: VisualBatchState[]): VisualPipelineState {
   const activeQuestions = questions.filter((question) => question.active !== false && hasRealQuestionReference(question));
   const answeredCount = activeQuestions.filter((question) => question.status === "answered").length;
@@ -1851,6 +1906,8 @@ export function NewAuditWorkspace() {
     ]);
   }
 
+  // LEGACY visual-pipeline-v1.
+  // El flujo nuevo usa lib/visual-pipeline-v2.ts y no depende de los helpers de orquestación que siguen.
   async function fetchVisualStage<T>(input: {
     endpoint: string;
     payload: unknown;
@@ -2640,49 +2697,16 @@ export function NewAuditWorkspace() {
   async function handleAnalyzeVisually(source = "unknown") {
     registerVisualAnalyzeInteraction("CLICK_ANALIZAR_VISUAL_RECIBIDO", source);
     setVisualAnalysisMessage("Iniciando analisis visual...");
-    const pipelineStartedAt = Date.now();
-
-    if (imageLinks.length === 0) {
-      setPreviewError({ message: "No hay fotos reales detectadas para analizar." });
-      setVisualAnalysisMessage("No hay fotos reales detectadas para analizar.");
-      pushVisualLog("error", "No hay fotos reales detectadas para analizar.");
-      return;
-    }
-
-    if (activeProjectQuestions.length === 0) {
-      setPreviewError({ message: "No hay preguntas precargadas para analizar." });
-      setVisualAnalysisMessage("No hay preguntas precargadas para analizar.");
-      pushVisualLog("error", "No hay preguntas precargadas para analizar.");
-      return;
-    }
-
-    if (!generalInstructions.trim()) {
-      setPreviewError({ message: "Faltan instrucciones generales del proyecto." });
-      setVisualAnalysisMessage("Faltan instrucciones generales del proyecto.");
-      pushVisualLog("error", "Faltan instrucciones generales del proyecto.");
-      return;
-    }
-
-    setVisualAnalyzing(true);
+      setVisualAnalyzing(true);
     setVisualAnalysisMessage("Analizando visualmente...");
     setPreviewError(null);
     setVisualAnalysisLogs([]);
     setVisualPipelineState(createEmptyPipelineState());
     setPerPhotoAnalysis([]);
     setKnowledgeBase(buildEmptyKnowledgeBase());
+    setQuestionUnderstanding([]);
+    setQuestionUnderstandingFingerprint(null);
     pushVisualLog("iniciando análisis visual", { source });
-    pushVisualLog("fotos disponibles", {
-      count: imageLinks.length,
-      indexes: imageLinks.map((image) => image.index)
-    });
-    pushVisualLog("preguntas activas disponibles", {
-      count: activeProjectQuestions.length,
-      questionIds: activeProjectQuestions.map((question) => question.id)
-    });
-    pushVisualLog("QUESTIONS_SENT", {
-      questionIds: activeProjectQuestions.map((question) => question.id),
-      questionCount: activeProjectQuestions.length
-    });
     let analyzeStatus: number | null = null;
     let analyzeBody: unknown = null;
     let analyzeRawText = "";
@@ -2693,33 +2717,18 @@ export function NewAuditWorkspace() {
         activeProjectQuestions.some((item) => item.id === question.id) ? resetQuestionVisualResult(question) : question
       );
       setProjectQuestions(cleanedProjectQuestions);
+
       const serializedQuestions = await serializeVisualQuestions(activeProjectQuestions);
       serializedQuestionsRef.current = serializedQuestions;
-      const questionBankHash = buildQuestionBankHash(activeProjectQuestions);
-      const cachedUnderstanding =
-        questionUnderstandingFingerprint === questionBankHash.fingerprint && questionUnderstanding.length === activeProjectQuestions.length
-          ? questionUnderstanding
-          : getCachedQuestionUnderstanding(questionBankHash.hash);
-      const hasCompleteCachedUnderstanding =
-        Array.isArray(cachedUnderstanding) &&
-        cachedUnderstanding.length === activeProjectQuestions.length &&
-        activeProjectQuestions.every((question) => cachedUnderstanding.some((item) => item.questionId === question.id));
-      const batchSize = chooseQuestionBatchSize({
-        questionCount: serializedQuestions.length,
-        photoCount: imageLinks.length,
-        generalInstructions
-      });
-      const chunks = splitIntoChunks(serializedQuestions, batchSize);
-      const initialBatchStates = chunks.map((chunk, index) => ({
-        batchNumber: index + 1,
-        totalBatches: chunks.length,
-        questionIds: chunk.map((question) => question.id),
-        status: "pending" as VisualBatchStatus,
-        error: null
-      }));
+      const storePhotos = buildStorePhotosForVisualAnalysis();
+      storePhotosRef.current = storePhotos;
+      const initialBatchStates = buildVisualBatchStatesForV2(serializedQuestions, 2);
+      let workingQuestions = [...cleanedProjectQuestions];
+      let workingKnowledgeBase = buildEmptyKnowledgeBase();
+      let nextBatchStates = initialBatchStates.map((batch) => ({ ...batch }));
 
       setVisualPipelineState({
-        storePreScan: "running",
+        storePreScan: "pending",
         knowledgeBaseMerge: "pending",
         finalReview: "pending",
         batchStates: initialBatchStates,
@@ -2730,156 +2739,194 @@ export function NewAuditWorkspace() {
         batchFailures: []
       });
 
-      const phaseAStartedAt = Date.now();
-      pushVisualLog("PHASE_A_QUESTION_BANK_STARTED", {
-        questionIds: serializedQuestions.map((question) => question.id),
-        questionCount: serializedQuestions.length,
-        cacheHit: hasCompleteCachedUnderstanding,
-        timestamp: new Date().toISOString()
-      });
-      const phaseAResult = hasCompleteCachedUnderstanding && cachedUnderstanding
-        ? {
-            questionUnderstanding: cachedUnderstanding,
-            receivedQuestionIds: cachedUnderstanding.map((item) => item.questionId),
-            missingQuestionIds: [] as number[],
-            status: "completed" as const
+      const pipelineResult = await runVisualAuditV2({
+        activeQuestions: serializedQuestions,
+        storePhotos,
+        generalInstructions,
+        answerBatchSize: 2,
+        phaseAMaxAttempts: 3,
+        callbacks: {
+          onLog: (entry) => {
+            pushVisualLog(entry.message, entry.detail);
+          },
+          onRequestMeta: (meta) => {
+            payloadSizeBytes = meta.payloadSizeBytes;
+            analyzeStatus = meta.status;
+            analyzeRawText = meta.rawText;
+            setLastVisualRequestMeta(meta);
+          },
+          onPhaseACompleted: (phaseAResult) => {
+            setQuestionUnderstanding(phaseAResult.questionUnderstanding);
+          },
+          onPhaseBCompleted: (phaseBResult) => {
+            workingKnowledgeBase = {
+              ...phaseBResult.knowledgeBase,
+              crossQuestionInsights: []
+            };
+            setPerPhotoAnalysis(phaseBResult.perPhotoAnalysis as PerPhotoAnalysis[]);
+            setKnowledgeBase(workingKnowledgeBase);
+            setVisualPipelineState((current) => ({
+              ...current,
+              storePreScan: "completed",
+              knowledgeBaseMerge: "running",
+              finalReview: "running"
+            }));
+            setVisualAnalysisMessage("Fase B completada.");
+          },
+          onPhaseCBatchStarted: (batchState) => {
+            nextBatchStates = nextBatchStates.map((batch) =>
+              batch.batchNumber === batchState.batchNumber
+                ? mapVisualPipelineV2BatchState(batchState)
+                : batch
+            );
+            setVisualPipelineState((current) => ({
+              ...current,
+              storePreScan: "completed",
+              knowledgeBaseMerge: "running",
+              finalReview: "running",
+              batchStates: nextBatchStates
+            }));
+            setProjectQuestions((current) =>
+              current.map((question) =>
+                batchState.questionIds.includes(question.id)
+                  ? {
+                      ...question,
+                      status: "analyzing"
+                    }
+                  : question
+              )
+            );
+            setVisualAnalysisMessage(`Batch ${batchState.batchNumber}/${batchState.totalBatches} running`);
+          },
+          onPhaseCBatchCompleted: ({ batchState, questionResults }) => {
+            workingQuestions = applyQuestionResultsToQuestions(workingQuestions, questionResults);
+            workingKnowledgeBase = buildMergedKnowledgeBase(workingKnowledgeBase, workingQuestions);
+            nextBatchStates = nextBatchStates.map((batch) =>
+              batch.batchNumber === batchState.batchNumber
+                ? mapVisualPipelineV2BatchState(batchState)
+                : batch
+            );
+            setProjectQuestions([...workingQuestions]);
+            setKnowledgeBase(workingKnowledgeBase);
+            setVisualPipelineState({
+              ...buildFinalReviewState(workingQuestions, nextBatchStates),
+              storePreScan: "completed",
+              knowledgeBaseMerge: "running",
+              finalReview: "running"
+            });
+            setVisualAnalysisMessage(`Batch ${batchState.batchNumber}/${batchState.totalBatches} completado`);
+          },
+          onPhaseCBatchFailed: ({ batchState, questionResults, missingQuestionIds, message }) => {
+            workingQuestions = applyQuestionResultsToQuestions(workingQuestions, questionResults);
+            workingKnowledgeBase = buildMergedKnowledgeBase(workingKnowledgeBase, workingQuestions);
+            nextBatchStates = nextBatchStates.map((batch) =>
+              batch.batchNumber === batchState.batchNumber
+                ? mapVisualPipelineV2BatchState(batchState, {
+                    message,
+                    batch: batchState.batchNumber,
+                    questionIds: batchState.questionIds,
+                    expectedQuestionIds: batchState.questionIds,
+                    receivedQuestionIds: questionResults.map((question) => question.questionId),
+                    missingQuestionIds
+                  })
+                : batch
+            );
+            setProjectQuestions([...workingQuestions]);
+            setKnowledgeBase(workingKnowledgeBase);
+            setVisualPipelineState({
+              ...buildFinalReviewState(workingQuestions, nextBatchStates),
+              storePreScan: "completed",
+              knowledgeBaseMerge: "failed",
+              finalReview: "failed"
+            });
+            setVisualAnalysisMessage(`Batch ${batchState.batchNumber}/${batchState.totalBatches} failed`);
           }
-        : await analyzeQuestionBankInBatches({
-            serializedQuestions,
-            generalInstructions
-          });
-      setQuestionUnderstanding(phaseAResult.questionUnderstanding);
-      setQuestionUnderstandingFingerprint(questionBankHash.fingerprint);
-      if (!hasCompleteCachedUnderstanding) {
-        saveCachedQuestionUnderstanding(questionBankHash.hash, phaseAResult.questionUnderstanding);
-      }
-      pushVisualLog("PHASE_A_QUESTION_BANK_COMPLETED", {
-        questionIds: serializedQuestions.map((question) => question.id),
-        receivedQuestionIds: phaseAResult.receivedQuestionIds,
-        missingQuestionIds: phaseAResult.missingQuestionIds,
-        cacheHit: hasCompleteCachedUnderstanding,
-        durationMs: Date.now() - phaseAStartedAt,
-        timestamp: new Date().toISOString()
+        }
       });
 
-      const storePhotos = buildStorePhotosForVisualAnalysis();
-      storePhotosRef.current = storePhotos;
-      const storePayload = {
-        storePhotos,
-        generalInstructions
-      };
-      payloadSizeBytes = estimateUtf8Bytes(JSON.stringify(storePayload));
-      if (payloadSizeBytes > MAX_VISUAL_PAYLOAD_BYTES) {
-        throw new Error("El payload visual es demasiado grande. Reduce fotos o usa URLs en lugar de base64.");
-      }
-      const storeStageStartedAt = Date.now();
-      pushVisualLog("VISUAL_PIPELINE_STAGE_START", {
-        stage: "analyze-store-photos",
-        batchNumber: 0,
-        photoCount: storePhotos.length,
-        questionCount: 0,
-        timestamp: new Date().toISOString()
-      });
-      pushVisualLog("PHASE_B_STORE_ANALYSIS_STARTED", {
-        photoCount: storePhotos.length,
-        timestamp: new Date().toISOString()
-      });
-      pushVisualLog("payload enviado", {
-        stage: "store_pre_scan",
-        payloadSizeBytes,
-        photoCount: storePhotos.length,
-        questionCount: 0
-      });
-      setVisualAnalysisMessage("Store Pre-Scan running...");
-      const storeResult = await fetchVisualStage<VisualStoreAnalysisResponse & { storeVisualMemory?: Partial<KnowledgeBase> }>({
-        endpoint: "/api/new-audit/analyze-store-photos",
-        payload: storePayload,
-        payloadSizeBytes,
-        photoCount: storePhotos.length,
-        questionCount: 0,
-        timeoutMessage: "Store Pre-Scan excedio el timeout del servidor."
-      });
-      analyzeStatus = storeResult.response.status;
-      analyzeRawText = storeResult.rawText;
-      analyzeBody = storeResult.parsed;
-
-      const initialKnowledgeBase: KnowledgeBase = {
-        ...storeResult.parsed.knowledgeBase,
-        crossQuestionInsights: []
-      };
-      setPerPhotoAnalysis(storeResult.parsed.perPhotoAnalysis);
-      setKnowledgeBase(initialKnowledgeBase);
-      setVisualPipelineState((current) => ({
-        ...current,
+      workingQuestions = applyQuestionResultsToQuestions(cleanedProjectQuestions, pipelineResult.questionResults);
+      workingKnowledgeBase = buildMergedKnowledgeBase(
+        {
+          ...pipelineResult.knowledgeBase,
+          crossQuestionInsights: []
+        },
+        workingQuestions
+      );
+      nextBatchStates = pipelineResult.batchStates.map((batchState) => mapVisualPipelineV2BatchState(batchState));
+      setQuestionUnderstanding(pipelineResult.questionUnderstanding);
+      setPerPhotoAnalysis(pipelineResult.perPhotoAnalysis as PerPhotoAnalysis[]);
+      setKnowledgeBase(workingKnowledgeBase);
+      setProjectQuestions(workingQuestions);
+      setVisualPipelineState({
+        ...buildFinalReviewState(workingQuestions, nextBatchStates),
         storePreScan: "completed",
-        knowledgeBaseMerge: "running",
-        finalReview: "running"
-      }));
-      pushVisualLog("STORE_PRE_SCAN_COMPLETED", {
-        photoCount: storePhotos.length,
-        detectedProducts: initialKnowledgeBase.productsDetected.length,
-        detectedBrands: initialKnowledgeBase.brandsDetected.length
+        knowledgeBaseMerge: "completed",
+        finalReview: "completed"
       });
-      pushVisualLog("VISUAL_PIPELINE_STAGE_END", {
-        stage: "analyze-store-photos",
-        batchNumber: 0,
-        durationMs: Date.now() - storeStageStartedAt,
-        status: storeResult.response.status,
-        photoCount: storePhotos.length,
-        questionCount: 0,
-        timestamp: new Date().toISOString()
-      });
-      pushVisualLog("PHASE_B_STORE_ANALYSIS_COMPLETED", {
-        photoCount: storePhotos.length,
-        durationMs: Date.now() - storeStageStartedAt,
-        timestamp: new Date().toISOString()
-      });
-      const phaseCStartedAt = Date.now();
-      const activeQuestionIds = serializedQuestions.map((question) => question.id);
-      pushVisualLog("PHASE_C_ANSWERS_STARTED", {
-        questionIds: activeQuestionIds,
-        questionCount: serializedQuestions.length,
-        timestamp: new Date().toISOString()
-      });
-      const phaseCResult = await runQuestionBatchPipeline({
-        serializedQuestions,
-        storePhotos,
-        initialKnowledgeBase,
-        initialPerPhotoAnalysis: storeResult.parsed.perPhotoAnalysis,
-        startBatchIndex: 0,
-        questionUnderstanding: phaseAResult.questionUnderstanding,
-        initialWorkingQuestions: cleanedProjectQuestions,
-        initialBatchStates
-      });
-      pushVisualLog("PHASE_C_ANSWERS_COMPLETED", {
-        answeredQuestionIds: phaseCResult.workingQuestions
-          .filter((question) => question.status === "answered")
-          .map((question) => question.id),
-        failedQuestionIds: phaseCResult.batchFailures.flatMap((batch) => batch.questionIds),
-        durationMs: Date.now() - phaseCStartedAt,
-        timestamp: new Date().toISOString()
-      });
+      setVisualAnalysisMessage("PIPELINE_V2_COMPLETED");
     } catch (error) {
-      const rawMessage = error instanceof Error ? error.message : String(error);
-      const errorWithDetails = error as Error & {
-        endpoint?: string;
-        status?: number;
-        body?: unknown;
-        rawText?: string;
+      const errorCode = error instanceof VisualPipelineV2Error ? error.code : null;
+      const errorDetail = error instanceof VisualPipelineV2Error ? error.detail : {};
+      const message = error instanceof Error ? error.message : String(error);
+      analyzeStatus = errorDetail.status ?? analyzeStatus;
+      analyzeBody = errorDetail.body ?? analyzeBody;
+      analyzeRawText = errorDetail.rawText ?? analyzeRawText;
+      const errorDetails: ErrorDetails = {
+        message,
+        endpoint: errorDetail.endpoint ?? null,
+        status: analyzeStatus,
+        body: analyzeBody,
+        stack: error instanceof Error ? error.stack ?? null : null,
+        batch:
+          errorDetail.partialResult?.batchStates.find((batch) => batch.status === "failed")?.batchNumber ?? null,
+        questionIds:
+          errorDetail.expectedQuestionIds ?? activeProjectQuestions.map((question) => question.id),
+        expectedQuestionIds: errorDetail.expectedQuestionIds,
+        receivedQuestionIds: errorDetail.receivedQuestionIds,
+        missingQuestionIds: errorDetail.missingQuestionIds
       };
-      const message =
-        rawMessage === "REFERENCE_IMAGE_TOO_LARGE"
-          ? "El payload visual es demasiado grande. Reduce fotos o usa URLs en lugar de base64."
-          : rawMessage;
-      analyzeStatus = errorWithDetails.status ?? analyzeStatus;
-      analyzeBody = errorWithDetails.body ?? analyzeBody;
-      analyzeRawText = errorWithDetails.rawText ?? analyzeRawText;
-      const errorDetails = buildBatchErrorDetails({
-        error,
-        endpoint: errorWithDetails.endpoint ?? "/api/new-audit/analyze-store-photos",
-        batch: 0,
-        questionIds: activeProjectQuestions.map((question) => question.id)
-      });
+      setPreviewError(errorDetails);
+      if (error instanceof VisualPipelineV2Error && error.detail.partialResult) {
+        const partialQuestions = applyQuestionResultsToQuestions(
+          projectQuestions.map((question) =>
+            activeProjectQuestions.some((item) => item.id === question.id) ? resetQuestionVisualResult(question) : question
+          ),
+          error.detail.partialResult.questionResults
+        );
+        const partialBatchStates = error.detail.partialResult.batchStates.map((batchState) =>
+          mapVisualPipelineV2BatchState(batchState, batchState.errorMessage ? { message: batchState.errorMessage } : null)
+        );
+        const partialKnowledgeBase = error.detail.partialResult.knowledgeBase
+          ? buildMergedKnowledgeBase(
+              {
+                ...error.detail.partialResult.knowledgeBase,
+                crossQuestionInsights: []
+              },
+              partialQuestions
+            )
+          : buildEmptyKnowledgeBase();
+        setQuestionUnderstanding(error.detail.partialResult.questionUnderstanding);
+        setPerPhotoAnalysis(error.detail.partialResult.perPhotoAnalysis as PerPhotoAnalysis[]);
+        setKnowledgeBase(partialKnowledgeBase);
+        setProjectQuestions(partialQuestions);
+        setVisualPipelineState({
+          ...buildFinalReviewState(partialQuestions, partialBatchStates),
+          storePreScan:
+            errorCode === "PHASE_A_FAILED"
+              ? "pending"
+              : errorCode === "PHASE_B_FAILED"
+                ? "failed"
+                : "completed",
+          knowledgeBaseMerge:
+            errorCode === "PHASE_B_FAILED" || errorCode === "PHASE_C_FAILED" ? "failed" : "pending",
+          finalReview: "failed"
+        });
+      } else {
+        setVisualPipelineState((current) => ({
+          ...current,
+          finalReview: "failed"
+        }));
+      }
       pushVisualLog("error", {
         endpoint: errorDetails.endpoint,
         status: analyzeStatus,
@@ -2891,47 +2938,8 @@ export function NewAuditWorkspace() {
         batch: errorDetails.batch,
         questionIds: errorDetails.questionIds
       });
-      setPreviewError(errorDetails);
-      setVisualPipelineState((current) => ({
-        ...current,
-        storePreScan: current.storePreScan === "running" ? "failed" : current.storePreScan,
-        knowledgeBaseMerge: current.knowledgeBaseMerge === "running" ? "failed" : current.knowledgeBaseMerge,
-        finalReview: "failed"
-      }));
-      setVisualAnalysisMessage(
-        message === "OPENAI_API_KEY_NOT_CONFIGURED" ? "OPENAI_API_KEY_NOT_CONFIGURED" : "El analisis visual fallo."
-      );
-      setProjectQuestions((current) =>
-        current.map((question) =>
-          activeProjectQuestions.some((item) => item.id === question.id)
-            ? {
-                ...question,
-                status: "needs_review",
-                suggestedAnswer: "No puedo responder",
-                confidence: 0,
-                reasoning:
-                  message === "OPENAI_API_KEY_NOT_CONFIGURED"
-                    ? "No se pudo ejecutar el analisis visual porque falta OPENAI_API_KEY."
-                    : "El analisis visual no pudo completarse.",
-                storePhotosUsed: [],
-                evidence: [message],
-                visualDiagnostic: {
-                  whatTheQuestionAsks: question.text ?? "",
-                  requiredEvidence: [],
-                  evidenceFound: [],
-                  evidenceMissing: [message],
-                  visualComparisonWithReference: "No se pudo completar la comparacion visual.",
-                  decisionRuleApplied: "Se marco needs_review por fallo general del analisis."
-                }
-              }
-            : question
-        )
-      );
+      setVisualAnalysisMessage(message);
     } finally {
-      pushVisualLog("TOTAL_PIPELINE_DURATION_MS", {
-        durationMs: Date.now() - pipelineStartedAt,
-        timestamp: new Date().toISOString()
-      });
       setVisualAnalyzing(false);
     }
   }
@@ -4199,19 +4207,6 @@ export function NewAuditWorkspace() {
             >
               {visualAnalyzing ? "Analizando..." : "Analizar visualmente"}
             </button>
-            {visualPipelineState.batchStates
-              .filter((batch) => batch.status === "failed" || batch.status === "partial_failed")
-              .map((batch) => (
-                <button
-                  key={`retry-batch-${batch.batchNumber}`}
-                  className="audit-secondary-button"
-                  type="button"
-                  disabled={visualAnalyzing || surveyAnswering || surveyContinuing || surveyCompleting || surveySubmitting}
-                  onClick={() => void handleRetryBatch(batch.batchNumber)}
-                >
-                  Reintentar batch {batch.batchNumber}
-                </button>
-              ))}
             <button
               className="audit-secondary-button"
               type="button"
