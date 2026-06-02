@@ -78,11 +78,15 @@ type SurveyAnsweringLog = {
 };
 
 type SurveyAnsweringFinalState =
+  | "STEPPER_READY"
+  | "WAITING_FOR_CONTINUE"
   | "WAITING_FOR_PHOTO_SELECTION"
   | "WAITING_FOR_HUMAN_SUBMIT_CONFIRMATION"
   | "SURVEY_FINISHED"
   | "NEEDS_REVIEW_QUESTION_MATCH"
-  | "NEEDS_REVIEW_OPTION_MATCH";
+  | "NEEDS_REVIEW_OPTION_MATCH"
+  | "QUESTION_MATCH_FAILED"
+  | "DOM_EXTRACTION_FAILED";
 
 type SurveyAnsweringResult = MinimalWorkerResult & {
   finalState: SurveyAnsweringFinalState;
@@ -91,6 +95,19 @@ type SurveyAnsweringResult = MinimalWorkerResult & {
   traceability: SurveyTraceability;
   surveyCompletionNumber: string | null;
   preparedSessionId?: string | null;
+  stepperSessionId?: string | null;
+  currentQuestion?: CurrentSurveyQuestionExtraction | null;
+};
+
+type QuestionMatchDebug = {
+  screenshotPath: string | null;
+  visibleQuestionText: string;
+  visibleQuestions: string[];
+  visibleOptions: string[];
+  bodyInnerText: string;
+  htmlPreview: string;
+  selectorUsed: string;
+  reason: string;
 };
 
 type TraceabilityIncident = {
@@ -109,6 +126,9 @@ type QuestionTraceEntry = {
   selectedAnswer: string;
   selectedOptionText: string | null;
   timestamp: string;
+  status: "completed" | "failed";
+  selectorUsed: string | null;
+  error: string | null;
   beforeScreenshotPath: string | null;
   selectedScreenshotPath: string | null;
   afterScreenshotPath: string | null;
@@ -123,6 +143,7 @@ type TraceabilitySelectedPhoto = {
   imageName: string;
   imageIndex: number;
   sourceUrl: string;
+  selectorUsed?: string;
   timestamp: string;
 };
 
@@ -130,6 +151,27 @@ type TraceabilityCompletionNumber = {
   surveyCompletionNumber: string;
   timestamp: string;
   screenshot: string | null;
+};
+
+type CurrentSurveyQuestionOption = {
+  label: string;
+  value: string;
+  checked: boolean;
+  selector: string;
+};
+
+type CurrentSurveyQuestionExtraction = {
+  questionNumber: number | null;
+  probableQuestionText: string | null;
+  visibleQuestions: string[];
+  visibleOptionTexts: string[];
+  radioCount: number;
+  selectedRadioBefore: string | null;
+  options: CurrentSurveyQuestionOption[];
+  bodyTextPreview: string;
+  formCount: number;
+  tableCount: number;
+  error?: "DOM_EXTRACTION_FAILED";
 };
 
 type SurveyTraceability = {
@@ -157,6 +199,22 @@ type PreparedHumanSubmitSession = {
   actionLogs: SurveyAnsweringLog[];
   answeredQuestionIds: Set<number>;
   baseResult: MinimalWorkerResult;
+  createdAt: string;
+};
+
+type StepperSession = {
+  id: string;
+  browser: Awaited<ReturnType<typeof chromium.launch>>;
+  context: BrowserContext;
+  page: Page;
+  outputDir: string;
+  screenshots: string[];
+  traceability: SurveyTraceability;
+  actionLogs: SurveyAnsweringLog[];
+  answeredQuestionIds: Set<number>;
+  baseResult: MinimalWorkerResult;
+  input: SurveyAnsweringInput;
+  currentQuestion: CurrentSurveyQuestionExtraction | null;
   createdAt: string;
 };
 
@@ -213,6 +271,7 @@ type MinimalWorkerResult = {
     tableCount: number;
   }>;
   screenshots: string[];
+  questionMatchDebug?: QuestionMatchDebug | null;
   error?: string;
   stack?: string | null;
 };
@@ -687,6 +746,8 @@ type SurveyDomSnapshot = {
   photoSelectionDetected: boolean;
   fileInputVisible: boolean;
   imageCount: number;
+  bodyInnerText: string;
+  htmlPreview: string;
 };
 
 function scoreQuestionCandidate(text: string) {
@@ -848,10 +909,14 @@ async function inspectSurveyDom(page: Page): Promise<SurveyDomSnapshot> {
       .filter((text) => /^(si|sí|no|no puedo responder|no existe producto|no existe el producto)/i.test(text));
     const imageCount = Array.from(document.querySelectorAll("img")).filter(isVisible).length;
 
+    const bodyInnerText = cleanText(document.body?.innerText ?? "");
     const pageTextPreview = visibleTextNodes.join(" ").slice(0, 3000);
+    const htmlPreview = (document.body?.innerHTML ?? "").replace(/\s+/g, " ").trim().slice(0, 8000);
 
     return {
       pageTextPreview,
+      bodyInnerText,
+      htmlPreview,
       visibleInputs,
       visibleLabels,
       visibleTextNodes,
@@ -888,6 +953,9 @@ async function inspectSurveyDom(page: Page): Promise<SurveyDomSnapshot> {
     visibleOptionTexts: [] as string[],
     fileInputVisible: false,
     imageCount: 0
+    ,
+    bodyInnerText: "",
+    htmlPreview: ""
   };
 
   const mainSnapshot = await page.evaluate(evaluateDomSnapshot).catch(() => emptySnapshot);
@@ -924,13 +992,16 @@ async function inspectSurveyDom(page: Page): Promise<SurveyDomSnapshot> {
   const visibleLabels = snapshots.flatMap((snapshot) => snapshot.visibleLabels);
   const textCandidates = snapshots.flatMap((snapshot) => snapshot.visibleTextNodes);
   const questionCandidates = snapshots.flatMap((snapshot) => snapshot.questionBlocks);
-  const fullBodyText = pageTextPreview.replace(/\s+/g, " ").trim();
+  const fullBodyText = uniqueTexts(snapshots.map((snapshot) => snapshot.bodyInnerText), 5).join(" ").slice(0, 12000);
+  const extractedFromBody = extractQuestionsFromBodyText(fullBodyText);
   const rankedQuestionCandidates = uniqueTexts(questionCandidates, 100)
     .map((text) => ({ text, score: scoreQuestionCandidate(text) }))
     .filter((candidate) => candidate.score >= 30)
     .sort((left, right) => right.score - left.score);
 
   const probableQuestionText =
+    extractedFromBody.find((text) => /^\d+[\).\s-]/.test(text) && text.includes("?")) ??
+    extractedFromBody.find((text) => text.includes("?")) ??
     rankedQuestionCandidates
       .find((candidate) => /^\d+[\).\s-]/.test(candidate.text) && candidate.text.includes("?"))
       ?.text ??
@@ -952,6 +1023,7 @@ async function inspectSurveyDom(page: Page): Promise<SurveyDomSnapshot> {
       ...rankedQuestionCandidates
         .filter((candidate) => /^\d+[\).\s-]/.test(candidate.text) || candidate.text.includes("?"))
         .map((candidate) => candidate.text),
+      ...extractedFromBody,
       ...optionCandidates
     ],
     20
@@ -995,7 +1067,9 @@ async function inspectSurveyDom(page: Page): Promise<SurveyDomSnapshot> {
     questionNumber,
     photoSelectionDetected,
     fileInputVisible: snapshots.some((snapshot) => snapshot.fileInputVisible),
-    imageCount: snapshots.reduce((sum, snapshot) => sum + snapshot.imageCount, 0)
+    imageCount: snapshots.reduce((sum, snapshot) => sum + snapshot.imageCount, 0),
+    bodyInnerText: fullBodyText,
+    htmlPreview: uniqueTexts(snapshots.map((snapshot) => snapshot.htmlPreview), 3).join("\n\n").slice(0, 12000)
   };
 }
 
@@ -1047,10 +1121,52 @@ function buildQuestionTextsForMatch(snapshot: SurveyDomSnapshot) {
     [
       snapshot.probableQuestionText ?? "",
       ...snapshot.visibleQuestions,
-      snapshot.pageTextPreview.slice(0, 1500)
+      snapshot.pageTextPreview.slice(0, 1500),
+      snapshot.bodyInnerText.slice(0, 3000)
     ],
     10
   );
+}
+
+function extractQuestionsFromBodyText(bodyText: string) {
+  const cleaned = bodyText.replace(/\s+/g, " ").trim();
+  if (!cleaned) {
+    return [];
+  }
+
+  const patternMatches = [
+    ...cleaned.matchAll(/(?:^|\s)(\d+[A-Z]?[.)-]\s*[^?.!]{5,500}\?)/gi),
+    ...cleaned.matchAll(/(?:^|\s)(¿[^?]{5,500}\?)/g)
+  ]
+    .map((match) => match[1]?.trim() ?? "")
+    .filter(Boolean);
+
+  const optionAnchoredMatches = cleaned
+    .split(/(?=\b(?:si|sí|no|no puedo responder)\b)/i)
+    .map((segment) => segment.trim())
+    .filter((segment) => segment.length >= 15 && /[?¿]/.test(segment))
+    .slice(0, 10);
+
+  return uniqueTexts([...patternMatches, ...optionAnchoredMatches], 20);
+}
+
+function buildQuestionMatchDebug(
+  snapshot: SurveyDomSnapshot,
+  reason: string,
+  screenshotPath: string | null,
+  selectorUsed: string,
+  visibleOptions?: string[]
+): QuestionMatchDebug {
+  return {
+    screenshotPath,
+    visibleQuestionText: snapshot.probableQuestionText ?? "",
+    visibleQuestions: snapshot.visibleQuestions,
+    visibleOptions: visibleOptions ?? snapshot.visibleOptionTexts,
+    bodyInnerText: snapshot.bodyInnerText.slice(0, 8000),
+    htmlPreview: snapshot.htmlPreview.slice(0, 8000),
+    selectorUsed,
+    reason
+  };
 }
 
 function matchVisibleQuestion(
@@ -1117,11 +1233,17 @@ async function extractVisibleRadioOptions(page: Page) {
     page.frames().map(async (frame) => {
       const radios = frame.locator("input[type='radio']");
       const total = await radios.count();
-      const frameOptions: Array<{ locator: Locator; text: string }> = [];
+      const frameOptions: Array<{
+        locator: Locator;
+        text: string;
+        value: string;
+        checked: boolean;
+        selector: string;
+      }> = [];
 
       for (let index = 0; index < total; index += 1) {
         const locator = radios.nth(index);
-        const text = await locator
+        const details = await locator
           .evaluate((element) => {
             const input = element as HTMLInputElement;
             const clean = (value: string | null | undefined) => (value ?? "").replace(/\s+/g, " ").trim();
@@ -1133,10 +1255,21 @@ async function extractVisibleRadioOptions(page: Page) {
                 input.closest("td, th, div, span, p")?.textContent ||
                 input.closest("tr")?.textContent
             );
+            const selector =
+              input.id
+                ? `#${input.id}`
+                : input.name
+                  ? `input[type="radio"][name="${input.name}"]`
+                  : "input[type=\"radio\"]";
 
-            return nativeLabels[0] || wrappingText || siblingText || clean(input.value);
+            return {
+              text: nativeLabels[0] || wrappingText || siblingText || clean(input.value),
+              value: clean(input.value),
+              checked: input.checked,
+              selector
+            };
           })
-          .catch(() => "");
+          .catch(() => null);
 
         if (!(await isLocatorVisible(locator))) {
           continue;
@@ -1144,7 +1277,22 @@ async function extractVisibleRadioOptions(page: Page) {
 
         frameOptions.push({
           locator,
-          text
+          text:
+            !details
+              ? ""
+              : details.text,
+          value:
+            !details
+              ? ""
+              : details.value,
+          checked:
+            !details
+              ? false
+              : details.checked,
+          selector:
+            !details
+              ? `input[type="radio"]:nth-of-type(${index + 1})`
+              : details.selector
         });
       }
 
@@ -1186,7 +1334,9 @@ async function selectSurveyAnswerOption(page: Page, requestedAnswer: string) {
     return {
       ok: false as const,
       visibleOptions: [],
-      selectedOptionText: null
+      selectedOptionText: null,
+      selectorUsed: null,
+      validationPassed: false
     };
   }
 
@@ -1201,7 +1351,9 @@ async function selectSurveyAnswerOption(page: Page, requestedAnswer: string) {
     return {
       ok: false as const,
       visibleOptions: visibleOptions.map((option) => option.text),
-      selectedOptionText: null
+      selectedOptionText: null,
+      selectorUsed: null,
+      validationPassed: false
     };
   }
 
@@ -1209,11 +1361,67 @@ async function selectSurveyAnswerOption(page: Page, requestedAnswer: string) {
     await exactMatch.locator.click({ timeout: 10_000 });
   });
 
+  const validationPassed = await exactMatch.locator
+    .evaluate((element) => {
+      if (element instanceof HTMLInputElement) {
+        return element.checked;
+      }
+      return element.getAttribute("aria-checked") === "true";
+    })
+    .catch(() => false);
+
   return {
     ok: true as const,
     visibleOptions: visibleOptions.map((option) => option.text),
-    selectedOptionText: exactMatch.text
+    selectedOptionText: exactMatch.text,
+    selectorUsed: `radio:${exactMatch.text || requestedAnswer}`,
+    validationPassed
   };
+}
+
+export async function extractCurrentSurveyQuestion(page: Page): Promise<CurrentSurveyQuestionExtraction> {
+  const snapshot = await inspectSurveyDom(page);
+  const radioOptions = await extractVisibleRadioOptions(page);
+  const extraCounts = await page
+    .evaluate(() => ({
+      formCount: document.querySelectorAll("form").length,
+      tableCount: document.querySelectorAll("table").length
+    }))
+    .catch(() => ({ formCount: 0, tableCount: 0 }));
+  const formCount = extraCounts.formCount;
+  const tableCount = extraCounts.tableCount;
+  const selectedRadioBefore = radioOptions.find((option) => option.checked)?.text ?? null;
+  const extraction: CurrentSurveyQuestionExtraction = {
+    questionNumber: snapshot.questionNumber ? Number.parseInt(snapshot.questionNumber, 10) || null : null,
+    probableQuestionText: snapshot.probableQuestionText,
+    visibleQuestions: snapshot.visibleQuestions,
+    visibleOptionTexts: radioOptions.map((option) => option.text),
+    radioCount: snapshot.radioCount,
+    selectedRadioBefore,
+    options: radioOptions.map((option) => ({
+      label: option.text,
+      value: option.value,
+      checked: option.checked,
+      selector: option.selector
+    })),
+    bodyTextPreview: snapshot.bodyInnerText.slice(0, 3000) || snapshot.pageTextPreview,
+    formCount,
+    tableCount
+  };
+
+  if (
+    (snapshot.bodyInnerText.length > 0 || snapshot.radioCount > 0 || formCount > 0 || tableCount > 0) &&
+    !extraction.probableQuestionText &&
+    extraction.visibleQuestions.length === 0 &&
+    extraction.visibleOptionTexts.length === 0
+  ) {
+    return {
+      ...extraction,
+      error: "DOM_EXTRACTION_FAILED"
+    };
+  }
+
+  return extraction;
 }
 
 async function clickContinueFromQuestion(page: Page) {
@@ -1252,6 +1460,18 @@ function getPreparedHumanSubmitSessionsStore() {
   }
 
   return runtime.__preparedHumanSubmitSessions;
+}
+
+function getStepperSessionsStore() {
+  const runtime = globalThis as typeof globalThis & {
+    __stepperSessions?: Map<string, StepperSession>;
+  };
+
+  if (!runtime.__stepperSessions) {
+    runtime.__stepperSessions = new Map();
+  }
+
+  return runtime.__stepperSessions;
 }
 
 function sanitizeQuestionFilePart(value: string) {
@@ -1458,13 +1678,26 @@ async function selectPhotoForTraceability(
   await best.locator.check({ force: true, timeout: 10_000 }).catch(async () => {
     await best.locator.click({ timeout: 10_000 });
   });
+  const validated = await best.locator
+    .evaluate((element) => {
+      if (element instanceof HTMLInputElement) {
+        return element.checked;
+      }
+      return element.getAttribute("aria-checked") === "true";
+    })
+    .catch(() => false);
+
+  if (!validated) {
+    return null;
+  }
 
   const selectedImage = best.image ?? imageLinks[0] ?? null;
   return selectedImage
     ? {
         imageName: selectedImage.href.split("/").at(-1) ?? `image-${selectedImage.index}`,
         imageIndex: selectedImage.index,
-        sourceUrl: selectedImage.href
+        sourceUrl: selectedImage.href,
+        selectorUsed: `photo:${best.text || best.imageSrc || selectedImage.index}`
       }
     : null;
 }
@@ -1973,6 +2206,7 @@ export async function runSurveyAnsweringUntilPhotoSelection(
   const answeredQuestionIds = new Set<number>();
   const traceability = createEmptyTraceability();
   const surveyCompletionNumber = null;
+  let questionMatchDebug: QuestionMatchDebug | null = null;
   let currentStep = "opening_survey";
   let baseResult: MinimalWorkerResult | null = null;
 
@@ -2023,6 +2257,42 @@ export async function runSurveyAnsweringUntilPhotoSelection(
     };
 
     if (!reachedFirstQuestion.detectedFirstQuestion) {
+      const failureSnapshot = await inspectSurveyDom(page).catch(() => null);
+      const screenshotPath = await saveScreenshot(
+        page,
+        outputDir,
+        "question-match-failed.png",
+        screenshots,
+        undefined,
+        currentStep
+      ).catch(() => null);
+      questionMatchDebug = buildQuestionMatchDebug(
+        failureSnapshot ?? {
+          pageTextPreview: "",
+          frameCount: 0,
+          frameUrls: [],
+          frameNames: [],
+          frames: [],
+          visibleInputs: [],
+          visibleLabels: [],
+          visibleQuestions: [],
+          probableQuestionText: null,
+          radioCount: 0,
+          textareaCount: 0,
+          selectCount: 0,
+          validatorVisible: false,
+          visibleOptionTexts: [],
+          questionNumber: null,
+          photoSelectionDetected: false,
+          fileInputVisible: false,
+          imageCount: 0,
+          bodyInnerText: "",
+          htmlPreview: ""
+        },
+        "No se detectó la primera pregunta real después de navegar la encuesta.",
+        screenshotPath,
+        "pollForClassicAspQuestion + inspectSurveyDom + document.body.innerText"
+      );
       pushLog("NEEDS_REVIEW_QUESTION_MATCH", { reason: "first_question_not_detected" });
       return {
         ...baseResult,
@@ -2032,7 +2302,8 @@ export async function runSurveyAnsweringUntilPhotoSelection(
         actionLogs,
         answeredQuestionIds: [],
         traceability,
-        surveyCompletionNumber
+        surveyCompletionNumber,
+        questionMatchDebug
       };
     }
 
@@ -2075,12 +2346,13 @@ export async function runSurveyAnsweringUntilPhotoSelection(
           ok: true,
           currentStep,
           screenshots,
-          finalState: "WAITING_FOR_PHOTO_SELECTION",
-          actionLogs,
-          answeredQuestionIds: Array.from(answeredQuestionIds),
-          traceability,
-          surveyCompletionNumber
-        };
+        finalState: "WAITING_FOR_PHOTO_SELECTION",
+        actionLogs,
+        answeredQuestionIds: Array.from(answeredQuestionIds),
+        traceability,
+        surveyCompletionNumber,
+        questionMatchDebug
+      };
       }
 
       pushLog("VISIBLE_QUESTION_EXTRACTED", {
@@ -2090,14 +2362,26 @@ export async function runSurveyAnsweringUntilPhotoSelection(
         visibleOptionTexts: snapshot.visibleOptionTexts
       });
 
-      const matched = matchVisibleQuestion(snapshot, input.questionResults, answeredQuestionIds);
-      if (!matched) {
+      if (!snapshot.probableQuestionText && snapshot.visibleQuestions.length === 0) {
         currentStep = "needs_review_question_match";
-        await saveScreenshot(page, outputDir, "19-needs-review-question-match.png", screenshots, undefined, currentStep);
+        const screenshotPath = await saveScreenshot(
+          page,
+          outputDir,
+          "question-match-failed.png",
+          screenshots,
+          undefined,
+          currentStep
+        ).catch(() => null);
+        questionMatchDebug = buildQuestionMatchDebug(
+          snapshot,
+          "No se detectó texto de pregunta visible antes del matching.",
+          screenshotPath,
+          "document.body.innerText + dom.questionBlocks + patrones numerados/interrogativos"
+        );
         pushLog("NEEDS_REVIEW_QUESTION_MATCH", {
-          questionNumber: snapshot.questionNumber,
-          probableQuestionText: snapshot.probableQuestionText,
-          visibleQuestions: snapshot.visibleQuestions
+          reason: questionMatchDebug.reason,
+          visibleOptions: snapshot.visibleOptionTexts,
+          selectorUsed: questionMatchDebug.selectorUsed
         });
         return {
           ...baseResult,
@@ -2108,7 +2392,47 @@ export async function runSurveyAnsweringUntilPhotoSelection(
           actionLogs,
           answeredQuestionIds: Array.from(answeredQuestionIds),
           traceability,
-          surveyCompletionNumber
+          surveyCompletionNumber,
+          questionMatchDebug
+        };
+      }
+
+      const matched = matchVisibleQuestion(snapshot, input.questionResults, answeredQuestionIds);
+      if (!matched) {
+        currentStep = "needs_review_question_match";
+        const screenshotPath = await saveScreenshot(
+          page,
+          outputDir,
+          "question-match-failed.png",
+          screenshots,
+          undefined,
+          currentStep
+        ).catch(() => null);
+        questionMatchDebug = buildQuestionMatchDebug(
+          snapshot,
+          "No se encontró una coincidencia segura de pregunta visible.",
+          screenshotPath,
+          "dom.questionBlocks + document.body.innerText fallback + patrones numerados/interrogativos"
+        );
+        pushLog("NEEDS_REVIEW_QUESTION_MATCH", {
+          reason: questionMatchDebug.reason,
+          questionNumber: snapshot.questionNumber,
+          probableQuestionText: snapshot.probableQuestionText,
+          visibleQuestions: snapshot.visibleQuestions,
+          visibleOptions: snapshot.visibleOptionTexts,
+          selectorUsed: questionMatchDebug.selectorUsed
+        });
+        return {
+          ...baseResult,
+          ok: false,
+          currentStep,
+          screenshots,
+          finalState: "NEEDS_REVIEW_QUESTION_MATCH",
+          actionLogs,
+          answeredQuestionIds: Array.from(answeredQuestionIds),
+          traceability,
+          surveyCompletionNumber,
+          questionMatchDebug
         };
       }
 
@@ -2136,7 +2460,8 @@ export async function runSurveyAnsweringUntilPhotoSelection(
             actionLogs,
             answeredQuestionIds: Array.from(answeredQuestionIds),
             traceability,
-            surveyCompletionNumber
+            surveyCompletionNumber,
+            questionMatchDebug
           };
         }
 
@@ -2161,7 +2486,8 @@ export async function runSurveyAnsweringUntilPhotoSelection(
           actionLogs,
           answeredQuestionIds: Array.from(answeredQuestionIds),
           traceability,
-          surveyCompletionNumber
+          surveyCompletionNumber,
+          questionMatchDebug
         };
       }
 
@@ -2204,7 +2530,8 @@ export async function runSurveyAnsweringUntilPhotoSelection(
           actionLogs,
           answeredQuestionIds: Array.from(answeredQuestionIds),
           traceability,
-          surveyCompletionNumber
+          surveyCompletionNumber,
+          questionMatchDebug
         };
       }
 
@@ -2247,7 +2574,8 @@ export async function runSurveyAnsweringUntilPhotoSelection(
       actionLogs,
       answeredQuestionIds: Array.from(answeredQuestionIds),
       traceability,
-      surveyCompletionNumber
+      surveyCompletionNumber,
+      questionMatchDebug
     };
   } catch (error) {
     await saveScreenshot(page, outputDir, "99-fatal-error.png", screenshots, undefined, currentStep).catch(() => undefined);
@@ -2287,12 +2615,422 @@ export async function runSurveyAnsweringUntilPhotoSelection(
       actionLogs,
       answeredQuestionIds: Array.from(answeredQuestionIds),
       traceability,
-      surveyCompletionNumber
+      surveyCompletionNumber,
+      questionMatchDebug
     };
   } finally {
     await page.close().catch(() => undefined);
     await context.close().catch(() => undefined);
     await browser.close().catch(() => undefined);
+  }
+}
+
+async function closeStepperSession(sessionId: string, session: StepperSession) {
+  getStepperSessionsStore().delete(sessionId);
+  await session.page.close().catch(() => undefined);
+  await session.context.close().catch(() => undefined);
+  await session.browser.close().catch(() => undefined);
+}
+
+function buildStepperResult(session: StepperSession, currentStep: string, finalState: SurveyAnsweringFinalState) {
+  return {
+    ...session.baseResult,
+    ok: !["QUESTION_MATCH_FAILED", "DOM_EXTRACTION_FAILED", "NEEDS_REVIEW_OPTION_MATCH", "NEEDS_REVIEW_QUESTION_MATCH"].includes(finalState),
+    finalUrl: session.page.url(),
+    title: null,
+    currentStep,
+    screenshots: session.screenshots,
+    finalState,
+    actionLogs: session.actionLogs,
+    answeredQuestionIds: Array.from(session.answeredQuestionIds),
+    traceability: session.traceability,
+    surveyCompletionNumber: null,
+    preparedSessionId: null,
+    stepperSessionId: session.id,
+    currentQuestion: session.currentQuestion
+  } satisfies SurveyAnsweringResult;
+}
+
+export async function answerNextSurveyQuestionStep(
+  input: SurveyAnsweringInput & { stepperSessionId?: string }
+): Promise<SurveyAnsweringResult> {
+  const store = getStepperSessionsStore();
+  let session = input.stepperSessionId ? store.get(input.stepperSessionId) ?? null : null;
+  let bootstrapBrowser: Awaited<ReturnType<typeof chromium.launch>> | null = null;
+  let bootstrapContext: BrowserContext | null = null;
+  let bootstrapPage: Page | null = null;
+  let bootstrapScreenshots: string[] = [];
+  let bootstrapOutputDir = "";
+  let bootstrapActionLogs: SurveyAnsweringLog[] = [];
+
+  try {
+    if (!session) {
+      bootstrapBrowser = await chromium.launch({ headless: true });
+      bootstrapContext = await bootstrapBrowser.newContext();
+      bootstrapPage = await bootstrapContext.newPage();
+      bootstrapScreenshots = [];
+      bootstrapOutputDir = buildOutputDir();
+      ensureDir(bootstrapOutputDir);
+      bootstrapActionLogs = [
+        {
+          timestamp: new Date().toISOString(),
+          event: "SURVEY_ANSWERING_STARTED",
+          detail: {
+            mode: "stepper",
+            step: "bootstrap",
+            questionResultsCount: input.questionResults.length
+          }
+        }
+      ];
+      const reachedFirstQuestion = await navigateUntilFirstQuestion(
+        bootstrapPage,
+        bootstrapContext,
+        bootstrapOutputDir,
+        bootstrapScreenshots,
+        input
+      );
+      const baseResult: MinimalWorkerResult = {
+        ok: reachedFirstQuestion.detectedFirstQuestion,
+        finalUrl: bootstrapPage.url(),
+        title: await bootstrapPage.title().catch(() => ""),
+        currentStep: reachedFirstQuestion.currentStep,
+        imageLinks: reachedFirstQuestion.imageLinks,
+        detectedFirstQuestion: reachedFirstQuestion.detectedFirstQuestion,
+        probableQuestionText: reachedFirstQuestion.probableQuestionText,
+        pageTextPreview: reachedFirstQuestion.pageTextPreview,
+        frameCount: reachedFirstQuestion.frameCount,
+        frameUrls: reachedFirstQuestion.frameUrls,
+        frameNames: reachedFirstQuestion.frameNames,
+        pollingIterations: reachedFirstQuestion.pollingIterations,
+        firstQuestionDetectedAtSecond: reachedFirstQuestion.firstQuestionDetectedAtSecond,
+        finalBodyTextLength: reachedFirstQuestion.finalBodyTextLength,
+        finalLabelCount: reachedFirstQuestion.finalLabelCount,
+        frames: reachedFirstQuestion.frames,
+        visibleInputs: reachedFirstQuestion.visibleInputs,
+        visibleLabels: reachedFirstQuestion.visibleLabels,
+        visibleQuestions: reachedFirstQuestion.visibleQuestions,
+        radioCount: reachedFirstQuestion.radioCount,
+        textareaCount: reachedFirstQuestion.textareaCount,
+        selectCount: reachedFirstQuestion.selectCount,
+        pollingDebug: reachedFirstQuestion.pollingDebug,
+        screenshots: bootstrapScreenshots
+      };
+      session = {
+        id: randomUUID(),
+        browser: bootstrapBrowser,
+        context: bootstrapContext,
+        page: bootstrapPage,
+        outputDir: bootstrapOutputDir,
+        screenshots: bootstrapScreenshots,
+        traceability: createEmptyTraceability(),
+        actionLogs: bootstrapActionLogs,
+        answeredQuestionIds: new Set<number>(),
+        baseResult,
+        input,
+        currentQuestion: null,
+        createdAt: new Date().toISOString()
+      };
+      store.set(session.id, session);
+      bootstrapBrowser = null;
+      bootstrapContext = null;
+      bootstrapPage = null;
+    } else {
+      session.input = input;
+      session.actionLogs.push({
+        timestamp: new Date().toISOString(),
+        event: "SURVEY_ANSWERING_STARTED",
+        detail: {
+          mode: "stepper",
+          step: "resume",
+          stepperSessionId: session.id
+        }
+      });
+    }
+
+    const pendingContinueTrace = [...session.traceability.questionTraces].reverse().find((entry) => !entry.afterScreenshotPath);
+    if (pendingContinueTrace) {
+      return buildStepperResult(session, "stepper_waiting_for_continue", "WAITING_FOR_CONTINUE");
+    }
+
+    const extraction = await extractCurrentSurveyQuestion(session.page);
+    session.currentQuestion = extraction;
+    session.baseResult = {
+      ...session.baseResult,
+      finalUrl: session.page.url(),
+      probableQuestionText: extraction.probableQuestionText,
+      pageTextPreview: extraction.bodyTextPreview,
+      radioCount: extraction.radioCount,
+      screenshots: session.screenshots
+    };
+    session.actionLogs.push({
+      timestamp: new Date().toISOString(),
+      event: "VISIBLE_QUESTION_EXTRACTED",
+      detail: extraction
+    });
+
+    if (extraction.error) {
+      await saveScreenshot(
+        session.page,
+        session.outputDir,
+        `q${String(extraction.questionNumber ?? "xx").padStart(2, "0")}-dom-extraction-failed.png`,
+        session.screenshots
+      ).catch(() => undefined);
+      return buildStepperResult(session, "stepper_dom_extraction_failed", "DOM_EXTRACTION_FAILED");
+    }
+
+    const snapshot = await inspectSurveyDom(session.page);
+    if (snapshot.photoSelectionDetected) {
+      session.currentQuestion = extraction;
+      return buildStepperResult(session, "stepper_waiting_for_photo_selection", "WAITING_FOR_PHOTO_SELECTION");
+    }
+    const matched = matchVisibleQuestion(snapshot, session.input.questionResults, session.answeredQuestionIds);
+    const questionNumberValue =
+      extraction.questionNumber ??
+      (snapshot.questionNumber ? Number.parseInt(snapshot.questionNumber, 10) || null : null) ??
+      (matched?.matchedQuestion.physicalNumber ? Number.parseInt(matched.matchedQuestion.physicalNumber, 10) || null : null);
+    const questionKey = String(questionNumberValue ?? "xx").padStart(2, "0");
+
+    const beforeScreenshotPath = await saveScreenshot(
+      session.page,
+      session.outputDir,
+      `q${questionKey}-before-answer.png`,
+      session.screenshots
+    ).catch(() => null);
+
+    if (!matched) {
+      session.actionLogs.push({
+        timestamp: new Date().toISOString(),
+        event: "NEEDS_REVIEW_QUESTION_MATCH",
+        detail: {
+          error: "QUESTION_MATCH_FAILED",
+          extraction
+        }
+      });
+      return {
+        ...buildStepperResult(session, "stepper_question_match_failed", "QUESTION_MATCH_FAILED"),
+        questionMatchDebug: {
+          screenshotPath: beforeScreenshotPath,
+          visibleQuestionText: extraction.probableQuestionText ?? "",
+          visibleQuestions: extraction.visibleQuestions,
+          visibleOptions: extraction.visibleOptionTexts,
+          bodyInnerText: extraction.bodyTextPreview,
+          htmlPreview: "",
+          selectorUsed: "extractCurrentSurveyQuestion + matchVisibleQuestion",
+          reason: "QUESTION_MATCH_FAILED"
+        }
+      };
+    }
+
+    const requestedAnswer = matched.matchedQuestion.suggestedAnswer?.trim() || "No puedo responder";
+    session.actionLogs.push({
+      timestamp: new Date().toISOString(),
+      event: "QUESTION_MATCHED",
+      detail: {
+        questionNumber: questionNumberValue,
+        probableQuestionText: extraction.probableQuestionText,
+        visibleQuestions: extraction.visibleQuestions,
+        visibleOptionTexts: extraction.visibleOptionTexts,
+        selectedAnswer: requestedAnswer
+      }
+    });
+
+    const optionSelection = await selectSurveyAnswerOption(session.page, requestedAnswer);
+    if (!optionSelection.ok || !optionSelection.validationPassed) {
+      const errorPath = await saveScreenshot(
+        session.page,
+        session.outputDir,
+        `q${questionKey}-error.png`,
+        session.screenshots
+      ).catch(() => null);
+      session.traceability.questionTraces.push({
+        questionKey,
+        questionNumber: String(questionNumberValue ?? matched.matchedQuestion.physicalNumber ?? matched.matchedQuestion.id),
+        matchedQuestionId: matched.matchedQuestion.id,
+        matchedConfidence: matched.matchScore,
+        visibleQuestionText: extraction.probableQuestionText ?? extraction.visibleQuestions.join(" | "),
+        selectedAnswer: requestedAnswer,
+        selectedOptionText: optionSelection.selectedOptionText,
+        timestamp: new Date().toISOString(),
+        status: "failed",
+        selectorUsed: optionSelection.selectorUsed,
+        error: "OPTION_SELECTION_FAILED",
+        beforeScreenshotPath,
+        selectedScreenshotPath: errorPath,
+        afterScreenshotPath: null
+      });
+      return buildStepperResult(session, "stepper_option_match_failed", "NEEDS_REVIEW_OPTION_MATCH");
+    }
+
+    const selectedScreenshotPath = await saveScreenshot(
+      session.page,
+      session.outputDir,
+      `q${questionKey}-answer-selected.png`,
+      session.screenshots
+    ).catch(() => null);
+    session.traceability.questionTraces.push({
+      questionKey,
+      questionNumber: String(questionNumberValue ?? matched.matchedQuestion.physicalNumber ?? matched.matchedQuestion.id),
+      matchedQuestionId: matched.matchedQuestion.id,
+      matchedConfidence: matched.matchScore,
+      visibleQuestionText: extraction.probableQuestionText ?? extraction.visibleQuestions.join(" | "),
+      selectedAnswer: requestedAnswer,
+      selectedOptionText: optionSelection.selectedOptionText,
+      timestamp: new Date().toISOString(),
+      status: "completed",
+      selectorUsed: optionSelection.selectorUsed,
+      error: null,
+      beforeScreenshotPath,
+      selectedScreenshotPath,
+      afterScreenshotPath: null
+    });
+    session.answeredQuestionIds.add(matched.matchedQuestion.id);
+    session.actionLogs.push({
+      timestamp: new Date().toISOString(),
+      event: "ANSWER_SELECTED",
+      detail: {
+        questionNumber: questionNumberValue,
+        selectedAnswer: requestedAnswer,
+        selectorUsed: optionSelection.selectorUsed
+      }
+    });
+
+    return buildStepperResult(session, "stepper_waiting_for_continue", "WAITING_FOR_CONTINUE");
+  } catch (error) {
+    if (session) {
+      const failedSession = session;
+      failedSession.actionLogs.push({
+        timestamp: new Date().toISOString(),
+        event: "NEEDS_REVIEW_QUESTION_MATCH",
+        detail: {
+          error: error instanceof Error ? error.message : String(error),
+          step: "stepper_unhandled_error"
+        }
+      });
+      await closeStepperSession(failedSession.id, failedSession);
+      return {
+        ...failedSession.baseResult,
+        ok: false,
+        finalUrl: failedSession.page.url?.() ?? failedSession.baseResult.finalUrl,
+        title: await failedSession.page.title().catch(() => failedSession.baseResult.title),
+        currentStep: "stepper_unhandled_error",
+        screenshots: failedSession.screenshots,
+        error: error instanceof Error ? error.message : String(error),
+        stack: error instanceof Error ? error.stack ?? null : null,
+        finalState: "NEEDS_REVIEW_QUESTION_MATCH",
+        actionLogs: failedSession.actionLogs,
+        answeredQuestionIds: Array.from(failedSession.answeredQuestionIds),
+        traceability: failedSession.traceability,
+        surveyCompletionNumber: null,
+        preparedSessionId: null,
+        stepperSessionId: null,
+        currentQuestion: failedSession.currentQuestion
+      };
+    }
+    await bootstrapPage?.close().catch(() => undefined);
+    await bootstrapContext?.close().catch(() => undefined);
+    await bootstrapBrowser?.close().catch(() => undefined);
+    return {
+      ok: false,
+      finalUrl: bootstrapPage?.url?.() ?? null,
+      title: bootstrapPage ? await bootstrapPage.title().catch(() => null) : null,
+      currentStep: "stepper_bootstrap_failed",
+      imageLinks: [],
+      detectedFirstQuestion: false,
+      probableQuestionText: null,
+      pageTextPreview: "",
+      frameCount: 0,
+      frameUrls: [],
+      frameNames: [],
+      pollingIterations: 0,
+      firstQuestionDetectedAtSecond: null,
+      finalBodyTextLength: 0,
+      finalLabelCount: 0,
+      frames: [],
+      visibleInputs: [],
+      visibleLabels: [],
+      visibleQuestions: [],
+      radioCount: 0,
+      textareaCount: 0,
+      selectCount: 0,
+      pollingDebug: [],
+      screenshots: bootstrapScreenshots,
+      error: error instanceof Error ? error.message : String(error),
+      stack: error instanceof Error ? error.stack ?? null : null,
+      finalState: "NEEDS_REVIEW_QUESTION_MATCH",
+      actionLogs: [
+        ...bootstrapActionLogs,
+        {
+          timestamp: new Date().toISOString(),
+          event: "NEEDS_REVIEW_QUESTION_MATCH",
+          detail: {
+            error: error instanceof Error ? error.message : String(error),
+            step: "stepper_bootstrap_failed"
+          }
+        }
+      ],
+      answeredQuestionIds: [],
+      traceability: createEmptyTraceability(),
+      surveyCompletionNumber: null,
+      preparedSessionId: null,
+      stepperSessionId: null,
+      currentQuestion: null
+    };
+  }
+}
+
+export async function continueSurveyQuestionStep(sessionId: string): Promise<SurveyAnsweringResult> {
+  const store = getStepperSessionsStore();
+  const session = store.get(sessionId);
+
+  if (!session) {
+    throw new Error("stepper_session_not_found");
+  }
+
+  try {
+    const latestTrace = [...session.traceability.questionTraces].reverse().find((entry) => !entry.afterScreenshotPath);
+    if (!latestTrace) {
+      return buildStepperResult(session, "stepper_ready", "STEPPER_READY");
+    }
+
+    await clickContinueFromQuestion(session.page);
+    const questionKey = sanitizeQuestionFilePart(latestTrace.questionNumber);
+    latestTrace.afterScreenshotPath =
+      (await saveScreenshot(
+        session.page,
+        session.outputDir,
+        `q${questionKey}-after-continue.png`,
+        session.screenshots
+      ).catch(() => null)) ?? null;
+    session.actionLogs.push({
+      timestamp: new Date().toISOString(),
+      event: "CONTINUE_CLICKED",
+      detail: {
+        questionNumber: latestTrace.questionNumber,
+        selectedAnswer: latestTrace.selectedAnswer,
+        selectorUsed: latestTrace.selectorUsed
+      }
+    });
+
+    const snapshot = await waitForSurveyContent(session.page);
+    if (snapshot.photoSelectionDetected) {
+      session.currentQuestion = await extractCurrentSurveyQuestion(session.page).catch(() => null);
+      return buildStepperResult(session, "stepper_waiting_for_photo_selection", "WAITING_FOR_PHOTO_SELECTION");
+    }
+
+    session.currentQuestion = await extractCurrentSurveyQuestion(session.page);
+    session.baseResult = {
+      ...session.baseResult,
+      finalUrl: session.page.url(),
+      probableQuestionText: session.currentQuestion.probableQuestionText,
+      pageTextPreview: session.currentQuestion.bodyTextPreview,
+      radioCount: session.currentQuestion.radioCount,
+      screenshots: session.screenshots
+    };
+
+    return buildStepperResult(session, "stepper_ready", "STEPPER_READY");
+  } catch (error) {
+    await closeStepperSession(session.id, session);
+    throw error;
   }
 }
 
@@ -2311,6 +3049,7 @@ export async function runSurveyCompletionWithTraceability(
   let baseResult: MinimalWorkerResult | null = null;
   let surveyCompletionNumber: string | null = null;
   let preparedSessionId: string | null = null;
+  let questionMatchDebug: QuestionMatchDebug | null = null;
 
   ensureDir(outputDir);
 
@@ -2358,6 +3097,35 @@ export async function runSurveyCompletionWithTraceability(
     };
 
     if (!reachedFirstQuestion.detectedFirstQuestion) {
+      const failureSnapshot = await inspectSurveyDom(page).catch(() => null);
+      const screenshotPath = await captureCriticalScreenshot("question-match-failed.png", "question_match_failed");
+      questionMatchDebug = buildQuestionMatchDebug(
+        failureSnapshot ?? {
+          pageTextPreview: "",
+          frameCount: 0,
+          frameUrls: [],
+          frameNames: [],
+          frames: [],
+          visibleInputs: [],
+          visibleLabels: [],
+          visibleQuestions: [],
+          probableQuestionText: null,
+          radioCount: 0,
+          textareaCount: 0,
+          selectCount: 0,
+          validatorVisible: false,
+          visibleOptionTexts: [],
+          questionNumber: null,
+          photoSelectionDetected: false,
+          fileInputVisible: false,
+          imageCount: 0,
+          bodyInnerText: "",
+          htmlPreview: ""
+        },
+        "No se detectó la primera pregunta real después de navegar la encuesta.",
+        screenshotPath,
+        "pollForClassicAspQuestion + inspectSurveyDom + document.body.innerText"
+      );
       pushLog("NEEDS_REVIEW_QUESTION_MATCH", { reason: "first_question_not_detected" });
       return {
         ...baseResult,
@@ -2367,7 +3135,8 @@ export async function runSurveyCompletionWithTraceability(
         actionLogs,
         answeredQuestionIds: [],
         traceability,
-        surveyCompletionNumber
+        surveyCompletionNumber,
+        questionMatchDebug
       };
     }
 
@@ -2403,7 +3172,7 @@ export async function runSurveyCompletionWithTraceability(
       if (snapshot.photoSelectionDetected) {
         photoStageReached = true;
         currentStep = "photo_selection_screen";
-        const screenshotPath = await captureCriticalScreenshot("photo-upload-screen.png", "photo_upload_screen");
+        const screenshotPath = await captureCriticalScreenshot("evidence-photos-before.png", "evidence_photos_before");
         traceability.photoUploadScreen = {
           path: screenshotPath,
           timestamp: new Date().toISOString()
@@ -2422,13 +3191,19 @@ export async function runSurveyCompletionWithTraceability(
         visibleOptionTexts: snapshot.visibleOptionTexts
       });
 
-      const matched = matchVisibleQuestion(snapshot, input.questionResults, answeredQuestionIds);
-      if (!matched) {
+      if (!snapshot.probableQuestionText && snapshot.visibleQuestions.length === 0) {
         currentStep = "needs_review_question_match";
+        const screenshotPath = await captureCriticalScreenshot("question-match-failed.png", "question_match_failed");
+        questionMatchDebug = buildQuestionMatchDebug(
+          snapshot,
+          "No se detectó texto de pregunta visible antes del matching.",
+          screenshotPath,
+          "document.body.innerText + dom.questionBlocks + patrones numerados/interrogativos"
+        );
         pushLog("NEEDS_REVIEW_QUESTION_MATCH", {
-          questionNumber: snapshot.questionNumber,
-          probableQuestionText: snapshot.probableQuestionText,
-          visibleQuestions: snapshot.visibleQuestions
+          reason: questionMatchDebug.reason,
+          visibleOptions: snapshot.visibleOptionTexts,
+          selectorUsed: questionMatchDebug.selectorUsed
         });
         return {
           ...baseResult,
@@ -2439,18 +3214,52 @@ export async function runSurveyCompletionWithTraceability(
           actionLogs,
           answeredQuestionIds: Array.from(answeredQuestionIds),
           traceability,
-          surveyCompletionNumber
+          surveyCompletionNumber,
+          questionMatchDebug
+        };
+      }
+
+      const matched = matchVisibleQuestion(snapshot, input.questionResults, answeredQuestionIds);
+      if (!matched) {
+        currentStep = "needs_review_question_match";
+        const screenshotPath = await captureCriticalScreenshot("question-match-failed.png", "question_match_failed");
+        questionMatchDebug = buildQuestionMatchDebug(
+          snapshot,
+          "No se encontró una coincidencia segura de pregunta visible.",
+          screenshotPath,
+          "dom.questionBlocks + document.body.innerText fallback + patrones numerados/interrogativos"
+        );
+        pushLog("NEEDS_REVIEW_QUESTION_MATCH", {
+          reason: questionMatchDebug.reason,
+          questionNumber: snapshot.questionNumber,
+          probableQuestionText: snapshot.probableQuestionText,
+          visibleQuestions: snapshot.visibleQuestions,
+          visibleOptions: snapshot.visibleOptionTexts,
+          selectorUsed: questionMatchDebug.selectorUsed
+        });
+        return {
+          ...baseResult,
+          ok: false,
+          currentStep,
+          screenshots,
+          finalState: "NEEDS_REVIEW_QUESTION_MATCH",
+          actionLogs,
+          answeredQuestionIds: Array.from(answeredQuestionIds),
+          traceability,
+          surveyCompletionNumber,
+          questionMatchDebug
         };
       }
 
       const questionNumber = snapshot.questionNumber || matched.matchedQuestion.physicalNumber || String(matched.matchedQuestion.id);
       const questionKey = sanitizeQuestionFilePart(questionNumber);
-      const beforeScreenshotPath = await captureCriticalScreenshot(`question-${questionKey}-before.png`, `question_${questionKey}_before`);
+      const beforeScreenshotPath = await captureCriticalScreenshot(`q${questionKey}-before-answer.png`, `question_${questionKey}_before_answer`);
       pushLog("QUESTION_MATCHED", {
         questionNumber,
         matchedQuestionId: matched.matchedQuestion.id,
         matchedConfidence: matched.matchScore,
-        visibleQuestionText: snapshot.probableQuestionText ?? snapshot.visibleQuestions.join(" | ")
+        visibleQuestionText: snapshot.probableQuestionText ?? snapshot.visibleQuestions.join(" | "),
+        selectedAnswer: matched.matchedQuestion.suggestedAnswer?.trim() || "No puedo responder"
       });
 
       let requestedAnswer = matched.matchedQuestion.suggestedAnswer?.trim() || "No puedo responder";
@@ -2470,7 +3279,8 @@ export async function runSurveyCompletionWithTraceability(
             actionLogs,
             answeredQuestionIds: Array.from(answeredQuestionIds),
             traceability,
-            surveyCompletionNumber
+            surveyCompletionNumber,
+            questionMatchDebug
           };
         }
 
@@ -2478,12 +3288,33 @@ export async function runSurveyCompletionWithTraceability(
       }
 
       const optionSelection = await selectSurveyAnswerOption(page, requestedAnswer);
-      if (!optionSelection.ok) {
+      if (!optionSelection.ok || !optionSelection.validationPassed) {
         currentStep = "needs_review_option_match";
+        const errorScreenshotPath = await captureCriticalScreenshot(`q${questionKey}-error.png`, `question_${questionKey}_error`);
         pushLog("NEEDS_REVIEW_OPTION_MATCH", {
           questionId: matched.matchedQuestion.id,
           requestedAnswer,
-          visibleOptions: optionSelection.visibleOptions
+          questionNumber,
+          visibleOptions: optionSelection.visibleOptions,
+          selectorUsed: optionSelection.selectorUsed,
+          screenshotPath: errorScreenshotPath,
+          reason: optionSelection.ok ? "selected_option_not_confirmed" : "option_not_found"
+        });
+        traceability.questionTraces.push({
+          questionKey,
+          questionNumber,
+          matchedQuestionId: matched.matchedQuestion.id,
+          matchedConfidence: matched.matchScore,
+          visibleQuestionText: snapshot.probableQuestionText ?? snapshot.visibleQuestions.join(" | "),
+          selectedAnswer: requestedAnswer,
+          selectedOptionText: optionSelection.selectedOptionText,
+          timestamp: new Date().toISOString(),
+          status: "failed",
+          selectorUsed: optionSelection.selectorUsed,
+          error: optionSelection.ok ? "selected_option_not_confirmed" : "option_not_found",
+          beforeScreenshotPath,
+          selectedScreenshotPath: errorScreenshotPath,
+          afterScreenshotPath: null
         });
         return {
           ...baseResult,
@@ -2494,13 +3325,14 @@ export async function runSurveyCompletionWithTraceability(
           actionLogs,
           answeredQuestionIds: Array.from(answeredQuestionIds),
           traceability,
-          surveyCompletionNumber
+          surveyCompletionNumber,
+          questionMatchDebug
         };
       }
 
       const selectedScreenshotPath = await captureCriticalScreenshot(
-        `question-${questionKey}-selected.png`,
-        `question_${questionKey}_selected`
+        `q${questionKey}-answer-selected.png`,
+        `question_${questionKey}_answer_selected`
       );
       answeredQuestionIds.add(matched.matchedQuestion.id);
       pushLog("ANSWER_SELECTED", {
@@ -2510,15 +3342,17 @@ export async function runSurveyCompletionWithTraceability(
         visibleQuestionText: snapshot.probableQuestionText ?? snapshot.visibleQuestions.join(" | "),
         selectedAnswer: requestedAnswer,
         selectedOptionText: optionSelection.selectedOptionText,
+        selectorUsed: optionSelection.selectorUsed,
         timestamp: new Date().toISOString()
       });
 
       const beforeSignature = buildQuestionSignature(snapshot);
       await clickContinueFromQuestion(page);
       currentStep = "answering_survey";
-      const afterScreenshotPath = await captureCriticalScreenshot(`question-${questionKey}-after.png`, `question_${questionKey}_after`);
+      const afterScreenshotPath = await captureCriticalScreenshot(`q${questionKey}-after-continue.png`, `question_${questionKey}_after_continue`);
       pushLog("CONTINUE_CLICKED", {
-        questionId: matched.matchedQuestion.id
+        questionId: matched.matchedQuestion.id,
+        questionNumber
       });
 
       traceability.questionTraces.push({
@@ -2530,6 +3364,9 @@ export async function runSurveyCompletionWithTraceability(
         selectedAnswer: requestedAnswer,
         selectedOptionText: optionSelection.selectedOptionText,
         timestamp: new Date().toISOString(),
+        status: "completed",
+        selectorUsed: optionSelection.selectorUsed,
+        error: null,
         beforeScreenshotPath,
         selectedScreenshotPath,
         afterScreenshotPath
@@ -2552,7 +3389,8 @@ export async function runSurveyCompletionWithTraceability(
           actionLogs,
           answeredQuestionIds: Array.from(answeredQuestionIds),
           traceability,
-          surveyCompletionNumber
+          surveyCompletionNumber,
+          questionMatchDebug
         };
       }
 
@@ -2571,7 +3409,8 @@ export async function runSurveyCompletionWithTraceability(
         actionLogs,
         answeredQuestionIds: Array.from(answeredQuestionIds),
         traceability,
-        surveyCompletionNumber
+        surveyCompletionNumber,
+        questionMatchDebug
       };
     }
 
@@ -2595,7 +3434,8 @@ export async function runSurveyCompletionWithTraceability(
         actionLogs,
         answeredQuestionIds: Array.from(answeredQuestionIds),
         traceability,
-        surveyCompletionNumber
+        surveyCompletionNumber,
+        questionMatchDebug
       };
     }
 
@@ -2604,13 +3444,14 @@ export async function runSurveyCompletionWithTraceability(
       timestamp: new Date().toISOString()
     };
     traceability.photoSelected = {
-      path: await captureCriticalScreenshot("photo-selected.png", "photo_selected"),
+      path: await captureCriticalScreenshot("evidence-photos-selected.png", "evidence_photos_selected"),
       timestamp: new Date().toISOString()
     };
     pushLog("PHOTO_SELECTED", {
       imageName: selectedPhoto.imageName,
       imageIndex: selectedPhoto.imageIndex,
       sourceUrl: selectedPhoto.sourceUrl,
+      selectorUsed: selectedPhoto.selectorUsed,
       timestamp: traceability.selectedPhoto.timestamp
     });
     pushLog("PHOTO_SELECTION_CONFIRMED", {
@@ -2620,7 +3461,7 @@ export async function runSurveyCompletionWithTraceability(
     await clickContinueFromQuestion(page);
     currentStep = "photo_confirmation_screen";
     traceability.photoConfirmationScreen = {
-      path: await captureCriticalScreenshot("photo-confirmation-screen.png", "photo_confirmation_screen"),
+      path: await captureCriticalScreenshot("evidence-photos-after-continue.png", "evidence_photos_after_continue"),
       timestamp: new Date().toISOString()
     };
     pushLog("PHOTO_CONFIRMATION_SCREEN_DETECTED");
@@ -2638,13 +3479,14 @@ export async function runSurveyCompletionWithTraceability(
         actionLogs,
         answeredQuestionIds: Array.from(answeredQuestionIds),
         traceability,
-        surveyCompletionNumber
+        surveyCompletionNumber,
+        questionMatchDebug
       };
     }
 
     currentStep = "survey_final_review";
     traceability.surveyFinalReview = {
-      path: await captureCriticalScreenshot("survey-final-review.png", "survey_final_review"),
+      path: await captureCriticalScreenshot("final-send-screen.png", "final_send_screen"),
       timestamp: new Date().toISOString()
     };
     pushLog("SURVEY_FINAL_REVIEW_DETECTED", {
@@ -2685,7 +3527,8 @@ export async function runSurveyCompletionWithTraceability(
       answeredQuestionIds: Array.from(answeredQuestionIds),
       traceability,
       surveyCompletionNumber,
-      preparedSessionId
+      preparedSessionId,
+      questionMatchDebug
     };
   } catch (error) {
     await saveScreenshot(page, outputDir, "99-fatal-error.png", screenshots).catch(() => undefined);
@@ -2726,7 +3569,8 @@ export async function runSurveyCompletionWithTraceability(
       answeredQuestionIds: Array.from(answeredQuestionIds),
       traceability,
       surveyCompletionNumber,
-      preparedSessionId
+      preparedSessionId,
+      questionMatchDebug
     };
   } finally {
     if (!preparedSessionId) {
@@ -2776,7 +3620,7 @@ export async function submitPreparedSurveyConfirmation(sessionId: string): Promi
     await page.waitForTimeout(1500);
     currentStep = "survey_submitted";
     traceability.surveySubmitted = {
-      path: await captureCriticalScreenshot("survey-submitted.png", "survey_submitted"),
+      path: await captureCriticalScreenshot("final-confirmation.png", "final_confirmation"),
       timestamp: new Date().toISOString()
     };
     pushLog("SURVEY_SUBMITTED");
