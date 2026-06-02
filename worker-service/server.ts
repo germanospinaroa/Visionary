@@ -17,6 +17,8 @@ import {
 } from "@/lib/new-audit-visual-analysis";
 import { createBrowserEvent, getSurveyRunDetails, updateSurveyRun } from "@/lib/pilot/db";
 import {
+  answerNextSurveyQuestionStep,
+  continueSurveyQuestionStep,
   runMinimalSurveyFlow,
   runSurveyAnsweringUntilPhotoSelection,
   runSurveyCompletionWithTraceability,
@@ -972,6 +974,111 @@ async function handleMinimalSurveyAction(
   });
 }
 
+async function handleMinimalStepperAction(
+  request: IncomingMessage,
+  response: ServerResponse,
+  action: "answer-next-question" | "continue-next-question"
+) {
+  const body = (await readJsonBody(request)) as MinimalRunRequestBody;
+
+  if (action === "continue-next-question") {
+    const stepperSessionId = body.stepperSessionId?.trim() ?? "";
+
+    log("info", "Minimal stepper continue payload received.", {
+      path: "/minimal-runs/continue-next-question",
+      origin: request.headers.origin ?? null,
+      stepperSessionId
+    });
+
+    if (!stepperSessionId) {
+      const payload = {
+        ok: false,
+        error: "missing_stepper_session_id"
+      };
+      writeJson(response, 400, payload);
+      log("warn", "Request completed.", {
+        method: "POST",
+        path: "/minimal-runs/continue-next-question",
+        status: 400,
+        body: payload
+      });
+      return;
+    }
+
+    const result = await continueSurveyQuestionStep(stepperSessionId);
+    writeJson(response, 200, result);
+    log(result.ok ? "info" : "warn", "Request completed.", {
+      method: "POST",
+      path: "/minimal-runs/continue-next-question",
+      status: 200,
+      body: {
+        ok: result.ok,
+        finalState: result.finalState,
+        currentStep: result.currentStep,
+        stepperSessionId: result.stepperSessionId ?? null
+      }
+    });
+    return;
+  }
+
+  const surveyUrl = body.surveyUrl?.trim() ?? "";
+  const storeCode = body.storeCode?.trim() ?? "";
+  const validatorCode = body.validatorCode?.trim() ?? "";
+  const stepperSessionId = body.stepperSessionId?.trim() ?? "";
+
+  log("info", "Minimal stepper answer payload received.", {
+    path: "/minimal-runs/answer-next-question",
+    origin: request.headers.origin ?? null,
+    body: {
+      surveyUrl,
+      storeCode,
+      validatorCode,
+      questionResultsCount: body.questionResults?.length ?? 0,
+      needsReviewBehavior: body.needsReviewBehavior ?? "stop",
+      stepperSessionId: stepperSessionId || null
+    }
+  });
+
+  if (!surveyUrl || !storeCode || !validatorCode) {
+    const payload = {
+      ok: false,
+      error: "missing_required_fields",
+      detail: "surveyUrl, storeCode y validatorCode son obligatorios."
+    };
+    writeJson(response, 400, payload);
+    log("warn", "Request completed.", {
+      method: "POST",
+      path: "/minimal-runs/answer-next-question",
+      status: 400,
+      body: payload
+    });
+    return;
+  }
+
+  const result = await answerNextSurveyQuestionStep({
+    surveyUrl,
+    storeCode,
+    validatorCode,
+    stepperSessionId,
+    questionResults: normalizeQuestionResults(body.questionResults),
+    needsReviewBehavior: body.needsReviewBehavior ?? "stop"
+  });
+
+  writeJson(response, 200, result);
+  log(result.ok ? "info" : "warn", "Request completed.", {
+    method: "POST",
+    path: "/minimal-runs/answer-next-question",
+    status: 200,
+    body: {
+      ok: result.ok,
+      finalState: result.finalState,
+      currentStep: result.currentStep,
+      stepperSessionId: result.stepperSessionId ?? null,
+      answeredQuestionIds: result.answeredQuestionIds ?? []
+    }
+  });
+}
+
 const server = createServer(async (request, response) => {
   const method = request.method ?? "GET";
   const url = new URL(request.url ?? "/", `http://${request.headers.host ?? `127.0.0.1:${port}`}`);
@@ -980,6 +1087,11 @@ const server = createServer(async (request, response) => {
   setCorsHeaders(request, response);
 
   log("info", "Incoming request.", {
+    method,
+    path: url.pathname,
+    origin
+  });
+  log("info", "ROUTER_ENTERED", {
     method,
     path: url.pathname,
     origin
@@ -1070,6 +1182,16 @@ const server = createServer(async (request, response) => {
       return;
     }
 
+    if (method === "POST" && url.pathname === "/minimal-runs/answer-next-question") {
+      await handleMinimalStepperAction(request, response, "answer-next-question");
+      return;
+    }
+
+    if (method === "POST" && url.pathname === "/minimal-runs/continue-next-question") {
+      await handleMinimalStepperAction(request, response, "continue-next-question");
+      return;
+    }
+
     if (method === "POST" && url.pathname === "/minimal-runs/complete-survey-trace") {
       await handleMinimalSurveyAction(request, response, "complete-survey-trace");
       return;
@@ -1091,16 +1213,31 @@ const server = createServer(async (request, response) => {
     }
 
     if (method === "POST" && url.pathname === "/new-audit/analyze-store-photos") {
+      log("info", "ROUTER_MATCH_ANALYZE_STORE_PHOTOS", {
+        method,
+        path: url.pathname,
+        origin
+      });
       await handleNewAuditAnalyzeStorePhotos(request, response);
       return;
     }
 
     if (method === "POST" && url.pathname === "/new-audit/analyze-question-bank") {
+      log("info", "ROUTER_MATCH_ANALYZE_QUESTION_BANK", {
+        method,
+        path: url.pathname,
+        origin
+      });
       await handleNewAuditAnalyzeQuestionBank(request, response);
       return;
     }
 
     if (method === "POST" && url.pathname === "/new-audit/answer-questions") {
+      log("info", "ROUTER_MATCH_ANSWER_QUESTIONS", {
+        method,
+        path: url.pathname,
+        origin
+      });
       await handleNewAuditAnswerQuestions(request, response);
       return;
     }
@@ -1134,6 +1271,11 @@ const server = createServer(async (request, response) => {
       error: "route_not_found",
       detail: "Ruta no encontrada."
     };
+    log("warn", "ROUTER_FELL_THROUGH_TO_ROUTE_NOT_FOUND", {
+      method,
+      path: url.pathname,
+      origin
+    });
     writeJson(response, 404, payload);
     log("warn", "Request completed.", {
       method,
